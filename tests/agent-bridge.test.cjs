@@ -91,3 +91,27 @@ test("Agent CLI 可以通过 Bridge 调用扩展 API", async () => {
   extension.close();
   await bridge.close();
 });
+
+test("Agent CLI 的 ask 会自动启动搜索、等待完成并返回结果", async () => {
+  const bridgeModule = await import("../agent-bridge.mjs");
+  const bridge = bridgeModule.createBridgeServer({ port: 0, token: TOKEN });
+  bridgeModule.routeBridgeMessages(bridge);
+  await bridge.listen();
+  const port = bridge.server.address().port;
+  const extension = await openSocket(`ws://127.0.0.1:${port}/agent?role=extension&token=${TOKEN}`);
+  extension.addEventListener("message", (event) => {
+    const message = JSON.parse(event.data);
+    if (message.type !== "request") return;
+    if (message.method === "startSearch") extension.send(JSON.stringify({ type: "response", id: message.id, result: { ok: true, apiVersion: 1, searchId: "search-1", running: true } }));
+    if (message.method === "getResults") extension.send(JSON.stringify({ type: "response", id: message.id, result: { ok: true, apiVersion: 1, searchId: "search-1", running: false, hasMore: false, nextCursor: null, total: 1, items: [{ id: "thread:Study:1", type: "thread", title: "课程资料", url: "https://bbs.byr.cn/article/Study/1" }] } }));
+    if (message.method === "getStatus") extension.send(JSON.stringify({ type: "response", id: message.id, result: { ok: true, apiVersion: 1, searchId: "search-1", status: "complete", running: false } }));
+  });
+  const result = await runCli(["ask", "--transport", "bridge", "--port", String(port), "--token", TOKEN, "--query", "课程资料", "--limit", "1"]);
+  assert.equal(result.code, 0, result.stderr);
+  const output = JSON.parse(result.stdout);
+  assert.equal(output.ok, true);
+  assert.equal(output.total, 1);
+  assert.equal(output.results[0].title, "课程资料");
+  extension.close();
+  await bridge.close();
+});

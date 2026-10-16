@@ -2,8 +2,112 @@
 
 import { fileURLToPath } from "node:url";
 import path from "node:path";
+import crypto from "node:crypto";
+import fs from "node:fs";
+import os from "node:os";
+import { spawn } from "node:child_process";
 
 const AGENT_GLOBAL = "__BYR_LOCAL_SEARCH_AGENT_V1__";
+const DEFAULT_BRIDGE_PORT = 17832;
+const CONFIG_FILE_NAME = "bridge.json";
+
+function configFilePath() {
+  const base = process.platform === "win32"
+    ? process.env.APPDATA || path.join(os.homedir(), "AppData", "Roaming")
+    : process.env.XDG_CONFIG_HOME || path.join(os.homedir(), ".config");
+  return path.join(base, "byr-local-search", CONFIG_FILE_NAME);
+}
+
+function readBridgeConfig() {
+  try {
+    const value = JSON.parse(fs.readFileSync(configFilePath(), "utf8"));
+    if (!value || typeof value !== "object") return null;
+    return value;
+  } catch {
+    return null;
+  }
+}
+
+function writeBridgeConfig(value) {
+  const file = configFilePath();
+  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(file, `${JSON.stringify(value, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+  try { fs.chmodSync(file, 0o600); } catch {}
+  return file;
+}
+
+function newToken() {
+  return crypto.randomBytes(24).toString("base64url");
+}
+
+function bridgeUrl(url, port, token) {
+  const target = new URL(url);
+  target.searchParams.set("agent", "1");
+  target.searchParams.set("api", "1");
+  target.searchParams.set("action", "configure");
+  target.searchParams.set("bridge", "1");
+  target.searchParams.set("bridgePort", String(port));
+  target.searchParams.set("bridgeToken", token);
+  target.searchParams.set("stream", "1");
+  return target.toString();
+}
+
+function baseExtensionUrl(url) {
+  if (!url) return "";
+  const target = new URL(url);
+  for (const key of ["bridge", "bridgePort", "bridgeToken"]) target.searchParams.delete(key);
+  return target.toString();
+}
+
+async function bridgeHealth(port, token) {
+  try {
+    const response = await fetch(`http://127.0.0.1:${port}/health?token=${encodeURIComponent(token)}`, { signal: AbortSignal.timeout(800) });
+    let body = null;
+    try { body = await response.json(); } catch {}
+    return { status: response.status, ...body, ok: Boolean(response.ok && body?.ok) };
+  } catch (error) {
+    return { status: 0, ok: false, error: error.message || "Bridge 暂不可访问" };
+  }
+}
+
+async function waitForBridge(port, token, timeoutMs = 6000) {
+  const deadline = Date.now() + timeoutMs;
+  let latest;
+  while (Date.now() < deadline) {
+    latest = await bridgeHealth(port, token);
+    if (latest.ok) return latest;
+    await new Promise((resolve) => setTimeout(resolve, 120));
+  }
+  return latest || { ok: false, status: 0, error: "Bridge 启动超时" };
+}
+
+function startBridgeProcess(port, token) {
+  const bridgeFile = path.join(path.dirname(fileURLToPath(import.meta.url)), "agent-bridge.mjs");
+  const child = spawn(process.execPath, [bridgeFile, "start", "--port", String(port), "--token", token], {
+    cwd: path.dirname(bridgeFile),
+    detached: true,
+    stdio: "ignore"
+  });
+  child.unref();
+}
+
+function openUrl(url) {
+  const command = process.platform === "darwin" ? "open" : process.platform === "win32" ? "cmd" : "xdg-open";
+  const args = process.platform === "win32" ? ["/c", "start", "", url] : [url];
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, { detached: true, stdio: "ignore" });
+    child.once("error", reject);
+    child.once("spawn", () => { child.unref(); resolve(); });
+  });
+}
+
+function bridgeCredentials(options) {
+  const saved = readBridgeConfig() || {};
+  const port = numberOption(options, "port", saved.port || DEFAULT_BRIDGE_PORT, 1024, 65535);
+  const token = String(options.token || saved.token || "");
+  if (!/^[A-Za-z0-9_-]{16,128}$/u.test(token)) throw new Error("尚未配置 Bridge 令牌，请先运行 node agent-cli.mjs setup");
+  return { port, token, saved };
+}
 
 function parseArgs(argv) {
   const [first, ...rest] = argv;
@@ -33,6 +137,9 @@ function cliHelp() {
   return `邮人全搜 Agent CLI（Node.js 22 或更高版本）
 
 用法：
+  node agent-cli.mjs setup --url "<扩展 Agent 页面 URL>"
+  node agent-cli.mjs doctor
+  node agent-cli.mjs ask --query "<关键词>"
   node agent-cli.mjs capabilities [--port 9222]
   node agent-cli.mjs capabilities --transport bridge --port 17832 --token <令牌>
   node agent-cli.mjs search --query "<关键词>" [--mode online] [--scope last-used] [--wait]
@@ -47,8 +154,11 @@ function cliHelp() {
   --token <令牌>    Agent Bridge 启动时输出的连接令牌
   --url <扩展 URL>  没有已打开的搜索页时尝试新建扩展页面
   --wait            搜索命令等待完成并输出最终结果
+  --no-open         setup 不自动打开扩展页面
   --pretty          美化 JSON 输出
   --query <关键词>  搜索关键词；请使用引号包住包含空格的内容
+
+小白用户推荐：先让 AI 执行 setup，再使用 ask；端口、令牌和轮询过程会自动处理。
 `;
 }
 
@@ -216,13 +326,19 @@ async function waitForResults(client, start, options) {
     await new Promise((resolve) => setTimeout(resolve, 1000));
   }
   const status = await invokeClient(client, "getStatus");
-  return { ok: true, searchId: start.searchId || latest.searchId, status, total: results.size, results: [...results.values()] };
+  const resultLimit = options.resultLimit === undefined ? undefined : numberOption(options, "resultLimit", 20, 1, 100);
+  const items = [...results.values()];
+  return { ok: true, searchId: start.searchId || latest.searchId, status, total: results.size, results: resultLimit ? items.slice(0, resultLimit) : items };
 }
 
 async function runCommand(client, options) {
-  if (options.command === "search") {
+  if (options.command === "search" || options.command === "ask") {
+    if (options.command === "ask" && !String(options.query || "").trim()) throw new Error("ask 需要 --query 搜索关键词");
     const start = await invokeClient(client, "startSearch", searchOptions(options));
-    if (options.wait || options.watch) output(await waitForResults(client, start, options), options.pretty);
+    if (options.command === "ask" || options.wait || options.watch) {
+      const waitOptions = options.command === "ask" ? { ...options, resultLimit: options.limit === undefined ? 20 : Number(options.limit) } : options;
+      output(await waitForResults(client, start, waitOptions), options.pretty);
+    }
     else output(start, options.pretty);
     return;
   }
@@ -243,13 +359,105 @@ async function runCommand(client, options) {
   output(await invokeClient(client, method, argument), options.pretty);
 }
 
+async function runSetup(options) {
+  const saved = readBridgeConfig() || {};
+  const explicitPort = options.port !== undefined;
+  const initialPort = numberOption(options, "port", saved.port || DEFAULT_BRIDGE_PORT, 1024, 65535);
+  const token = String(options.token || saved.token || newToken());
+  if (!/^[A-Za-z0-9_-]{16,128}$/u.test(token)) throw new Error("--token 必须是 16～128 位字母、数字、下划线或短横线");
+  const requestedUrl = options.url || saved.extensionUrl || "";
+  let selected = null;
+  let lastHealth;
+  for (let offset = 0; offset <= 10; offset += 1) {
+    const port = initialPort + offset;
+    if (port > 65535) break;
+    lastHealth = await bridgeHealth(port, token);
+    if (lastHealth.ok) { selected = { port, health: lastHealth, reused: true }; break; }
+    if (lastHealth.status === 401 && explicitPort) throw new Error(`端口 ${port} 已有其他 Bridge，令牌不匹配；请更换 --port 或提供正确的 --token`);
+    if (lastHealth.status === 401) continue;
+    startBridgeProcess(port, token);
+    const health = await waitForBridge(port, token);
+    if (health.ok) { selected = { port, health, reused: false }; break; }
+    lastHealth = health;
+  }
+  if (!selected) throw new Error(`无法启动本地 Bridge：${lastHealth?.error || `端口 ${initialPort} 不可用`}`);
+  const extensionUrl = requestedUrl ? baseExtensionUrl(requestedUrl) : saved.extensionUrl || "";
+  const openedUrl = extensionUrl ? bridgeUrl(extensionUrl, selected.port, token) : "";
+  const configPath = writeBridgeConfig({ port: selected.port, token, extensionUrl, updatedAt: new Date().toISOString() });
+  let opened = false;
+  if (openedUrl && !options["no-open"]) {
+    await openUrl(openedUrl);
+    opened = true;
+    selected.health = await waitForBridge(selected.port, token, 5000);
+  }
+  return {
+    ok: true,
+    ready: Boolean(selected.health.extensionConnected),
+    service: "byr-local-search-agent-bridge",
+    transport: "bridge",
+    port: selected.port,
+    tokenSaved: true,
+    reused: selected.reused,
+    extensionPageOpened: opened,
+    extensionConnected: Boolean(selected.health.extensionConnected),
+    configPath,
+    message: selected.health.extensionConnected
+      ? "扩展已连接，AI 可以直接使用 ask 搜索"
+      : (opened ? "扩展页面已打开，请等待 Agent 连接" : (extensionUrl ? "Bridge 已启动；请打开扩展页面以完成连接" : "Bridge 已启动；请提供扩展页面 URL 以完成连接"))
+  };
+}
+
+async function runDoctor(options) {
+  const credentials = bridgeCredentials(options);
+  const health = await bridgeHealth(credentials.port, credentials.token);
+  const result = {
+    ok: false,
+    ready: false,
+    transport: "bridge",
+    port: credentials.port,
+    checks: { config: Boolean(credentials.saved.token), bridge: Boolean(health.ok), extension: false, api: false },
+    extensionConnected: Boolean(health.extensionConnected),
+    message: ""
+  };
+  if (!health.ok) {
+    result.message = health.status === 401 ? "Bridge 令牌不匹配，请重新运行 setup 或检查 --token" : "无法连接 Bridge，请先运行 node agent-cli.mjs setup";
+    return result;
+  }
+  result.checks.extension = Boolean(health.extensionConnected);
+  if (!health.extensionConnected) {
+    result.message = "Bridge 正常，但扩展尚未连接；请打开 setup 输出的扩展页面";
+    return result;
+  }
+  const client = connectBridge(credentials.port, credentials.token);
+  try {
+    const capabilities = await client.request("getCapabilities");
+    result.checks.api = Boolean(capabilities.ok && capabilities.ready);
+  } catch (error) {
+    result.message = error.message || "无法调用扩展 Agent API";
+    return result;
+  } finally {
+    client.close();
+  }
+  result.ok = result.ready = result.checks.api;
+  result.message = result.ready ? "Bridge、扩展和 Agent API 均已连接" : "扩展已连接，但 Agent API 尚未准备好";
+  return result;
+}
+
 async function run(options) {
   if (options.help) { process.stdout.write(cliHelp()); return; }
-  const transport = options.transport || "cdp";
+  if (options.command === "setup") { output(await runSetup(options), options.pretty); return; }
+  if (options.command === "doctor") {
+    let result;
+    try { result = await runDoctor(options); }
+    catch (error) { result = { ok: false, ready: false, checks: { config: false, bridge: false, extension: false, api: false }, message: error.message || "诊断失败" }; }
+    output(result, options.pretty);
+    return result.ready ? 0 : 1;
+  }
+  const transport = options.transport || (options.command === "ask" ? "bridge" : "cdp");
   if (!["cdp", "bridge"].includes(transport)) throw new Error("--transport 只能是 cdp 或 bridge");
   if (transport === "bridge") {
-    const port = numberOption(options, "port", 17832, 1024, 65535);
-    const client = connectBridge(port, options.token);
+    const credentials = bridgeCredentials(options);
+    const client = connectBridge(credentials.port, credentials.token);
     try { await runCommand(client, options); }
     finally { client.close(); }
     return;
@@ -269,7 +477,8 @@ async function run(options) {
 
 async function main(argv = process.argv.slice(2)) {
   try {
-    await run(parseArgs(argv));
+    const exitCode = await run(parseArgs(argv));
+    if (Number.isInteger(exitCode)) process.exitCode = exitCode;
   } catch (error) {
     output({ ok: false, error: { message: error.message || "CLI 调用失败" } });
     process.exitCode = 1;
@@ -279,4 +488,4 @@ async function main(argv = process.argv.slice(2)) {
 const isDirect = process.argv[1] && path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url));
 if (isDirect) main();
 
-export { applyChanges, blockedExtensionPageMessage, connectBridge, invokeClient, parseArgs, searchOptions, waitForResults };
+export { applyChanges, blockedExtensionPageMessage, bridgeUrl, configFilePath, connectBridge, invokeClient, parseArgs, runDoctor, searchOptions, waitForResults };

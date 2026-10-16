@@ -11,6 +11,20 @@ test("Agent CLI 帮助信息可直接从 Node.js 输出", () => {
   assert.equal(result.status, 0);
   assert.match(result.stdout, /Chrome DevTools Protocol/);
   assert.match(result.stdout, /node agent-cli\.mjs search/);
+  assert.match(result.stdout, /node agent-cli\.mjs setup/);
+  assert.match(result.stdout, /node agent-cli\.mjs ask/);
+});
+
+test("setup 会生成带 Bridge 参数的扩展页面地址", async () => {
+  const file = path.join(__dirname, "..", "agent-cli.mjs");
+  const { bridgeUrl, parseArgs } = await import(`file://${file}`);
+  const parsed = parseArgs(["setup", "--url", "chrome-extension://example/search.html?agent=1&api=1"]);
+  assert.equal(parsed.command, "setup");
+  const url = new URL(bridgeUrl(parsed.url, 17832, "0123456789abcdef0123456789abcdef"));
+  assert.equal(url.searchParams.get("bridge"), "1");
+  assert.equal(url.searchParams.get("bridgePort"), "17832");
+  assert.equal(url.searchParams.get("agent"), "1");
+  assert.equal(url.searchParams.get("api"), "1");
 });
 
 test("Agent CLI 将命令参数转换为扩展 API 参数", async () => {
