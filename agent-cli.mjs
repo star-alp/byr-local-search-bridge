@@ -12,6 +12,9 @@ const DEFAULT_BRIDGE_PORT = 17832;
 const CONFIG_FILE_NAME = "bridge.json";
 // 直接调用扩展 Agent 的命令默认使用本地 Bridge，避免 AI 还要手动配置 Chrome 调试端口。
 const AGENT_COMMANDS = new Set(["ask", "preview", "context", "resources", "failures", "request-profile", "capabilities", "status", "scopes", "boards", "search", "results", "cancel", "pause", "resume", "retry"]);
+// 只对幂等读取请求自动重试，避免 startSearch、暂停和保存类操作被重复执行。
+const RETRYABLE_BRIDGE_METHODS = new Set(["getCapabilities", "getStatus", "getContext", "getResourceUsage", "getFailures", "previewSearch", "listScopes", "listBoards", "getResults"]);
+const BRIDGE_RETRY_DELAYS_MS = Object.freeze([500, 1500]);
 
 function configFilePath() {
   const base = process.platform === "win32"
@@ -285,6 +288,7 @@ function cliHelp() {
   --stream          搜索时逐条输出新增结果，最后输出 done 事件
   --query <关键词>  搜索关键词；请使用引号包住包含空格的内容
 
+只读状态、资源和结果请求遇到 Bridge 临时断线时会自动重试；启动、暂停、继续和重试任务不会自动重复执行。
 小白用户推荐：先让 AI 执行 setup，再使用 ask；端口、令牌和轮询过程会自动处理。
 `;
 }
@@ -366,41 +370,80 @@ function connectDebugger(url) {
 function connectBridge(port, token) {
   if (typeof WebSocket !== "function") throw new Error("当前 Node.js 没有内置 WebSocket，请使用 Node.js 22 或更高版本");
   if (!/^[A-Za-z0-9_-]{16,128}$/u.test(String(token || ""))) throw new Error("Bridge 需要有效的 --token");
-  const socket = new WebSocket(`ws://127.0.0.1:${port}/agent?role=agent&token=${encodeURIComponent(token)}`);
+  let socket = null;
+  let ready = null;
+  let closed = false;
   let nextId = 0;
   const pending = new Map();
-  const ready = new Promise((resolve, reject) => {
-    socket.addEventListener("open", () => {
-      socket.send(JSON.stringify({ type: "hello", role: "agent", protocolVersion: 1 }));
-      resolve();
-    }, { once: true });
-    socket.addEventListener("error", () => reject(new Error(`无法连接本地 Agent Bridge（127.0.0.1:${port}）`)), { once: true });
-  });
-  socket.addEventListener("message", (event) => {
-    let message;
-    try { message = JSON.parse(event.data); } catch { return; }
-    if (message.type !== "response" || !message.id) return;
-    const callback = pending.get(message.id);
-    if (!callback) return;
-    pending.delete(message.id);
-    callback(message.result);
-  });
-  socket.addEventListener("close", () => {
-    for (const callback of pending.values()) callback({ ok: false, error: { message: "本地 Agent Bridge 连接已关闭" } });
-    pending.clear();
-  });
+  function connectSocket() {
+    if (closed) return Promise.reject(Object.assign(new Error("本地 Agent Bridge 客户端已关闭"), { code: "BRIDGE_CLOSED" }));
+    if (ready) return ready;
+    const current = new WebSocket(`ws://127.0.0.1:${port}/agent?role=agent&token=${encodeURIComponent(token)}`);
+    socket = current;
+    ready = new Promise((resolve, reject) => {
+      let settled = false;
+      const fail = (error) => {
+        if (!settled) { settled = true; reject(error); }
+        if (socket === current) { socket = null; ready = null; }
+      };
+      current.addEventListener("open", () => {
+        current.send(JSON.stringify({ type: "hello", role: "agent", protocolVersion: 1 }));
+        settled = true;
+        resolve();
+      }, { once: true });
+      current.addEventListener("error", () => fail(Object.assign(new Error(`无法连接本地 Agent Bridge（127.0.0.1:${port}）`), { code: "BRIDGE_UNAVAILABLE" })), { once: true });
+      current.addEventListener("close", () => {
+        const errorResult = { ok: false, error: { code: "BRIDGE_DISCONNECTED", message: "本地 Agent Bridge 连接已关闭" } };
+        for (const callback of pending.values()) callback(errorResult);
+        pending.clear();
+        fail(Object.assign(new Error(errorResult.error.message), { code: errorResult.error.code }));
+      }, { once: true });
+      current.addEventListener("message", (event) => {
+        let message;
+        try { message = JSON.parse(event.data); } catch { return; }
+        if (message.type !== "response" || !message.id) return;
+        const callback = pending.get(message.id);
+        if (!callback) return;
+        pending.delete(message.id);
+        callback(message.result);
+      });
+    });
+    return ready;
+  }
+  const requestOnce = async (method, argument) => {
+    await connectSocket();
+    const current = socket;
+    const id = `${Date.now().toString(36)}-${++nextId}`;
+    const result = await new Promise((resolve) => {
+      pending.set(id, resolve);
+      try { current.send(JSON.stringify({ type: "request", id, method, argument })); }
+      catch { pending.delete(id); resolve({ ok: false, error: { code: "BRIDGE_DISCONNECTED", message: "本地 Agent Bridge 连接已关闭" } }); }
+    });
+    if (!result?.ok) throw Object.assign(new Error(result?.error?.message || `${method} 调用失败`), { code: result?.error?.code || "BRIDGE_REQUEST_FAILED" });
+    return result;
+  };
   return {
     async request(method, argument) {
-      await ready;
-      const id = `${Date.now().toString(36)}-${++nextId}`;
-      const result = await new Promise((resolve) => {
-        pending.set(id, resolve);
-        socket.send(JSON.stringify({ type: "request", id, method, argument }));
-      });
-      if (!result?.ok) throw new Error(result?.error?.message || `${method} 调用失败`);
-      return result;
+      let attempt = 0;
+      while (true) {
+        try {
+          return await requestOnce(method, argument);
+        } catch (error) {
+          const retryable = RETRYABLE_BRIDGE_METHODS.has(method)
+            && ["BRIDGE_DISCONNECTED", "BRIDGE_UNAVAILABLE", "EXTENSION_DISCONNECTED", "EXTENSION_NOT_CONNECTED", "EXTENSION_REQUEST_TIMEOUT"].includes(error?.code);
+          if (!retryable || attempt >= BRIDGE_RETRY_DELAYS_MS.length || closed) throw error;
+          await new Promise((resolve) => setTimeout(resolve, BRIDGE_RETRY_DELAYS_MS[attempt++]));
+        }
+      }
     },
-    close() { socket.close(); }
+    close() {
+      closed = true;
+      for (const callback of pending.values()) callback({ ok: false, error: { code: "BRIDGE_CLOSED", message: "本地 Agent Bridge 客户端已关闭" } });
+      pending.clear();
+      socket?.close();
+      socket = null;
+      ready = null;
+    }
   };
 }
 

@@ -156,6 +156,70 @@ test("Agent Bridge 支持多个 Agent 连接并按顺序处理请求", async () 
   await bridge.close();
 });
 
+test("Agent CLI 只对幂等读取请求自动重试临时断线", async () => {
+  const bridgeModule = await import("../agent-bridge.mjs");
+  const cliModule = await import("../agent-cli.mjs");
+  const bridge = bridgeModule.createBridgeServer({ port: 0, token: TOKEN });
+  bridgeModule.routeBridgeMessages(bridge);
+  await bridge.listen();
+  const port = bridge.server.address().port;
+  const extension = await openSocket(`ws://127.0.0.1:${port}/agent?role=extension&token=${TOKEN}`);
+  let reads = 0;
+  let starts = 0;
+  extension.addEventListener("message", (event) => {
+    const message = JSON.parse(event.data);
+    if (message.type !== "request") return;
+    if (message.method === "getStatus") {
+      reads += 1;
+      extension.send(JSON.stringify({ type: "response", id: message.id, result: reads === 1
+        ? { ok: false, apiVersion: 1, error: { code: "EXTENSION_DISCONNECTED", message: "模拟扩展重连" } }
+        : { ok: true, apiVersion: 1, method: message.method } }));
+    }
+    if (message.method === "startSearch") {
+      starts += 1;
+      extension.send(JSON.stringify({ type: "response", id: message.id, result: { ok: false, apiVersion: 1, error: { code: "EXTENSION_DISCONNECTED", message: "模拟扩展重连" } } }));
+    }
+  });
+  const client = cliModule.connectBridge(port, TOKEN);
+  const status = await client.request("getStatus");
+  assert.equal(status.method, "getStatus");
+  assert.equal(reads, 2);
+  await assert.rejects(() => client.request("startSearch", { query: "test" }), /模拟扩展重连/u);
+  assert.equal(starts, 1);
+  client.close();
+  extension.close();
+  await bridge.close();
+});
+
+test("Agent Bridge 请求超时会释放当前请求和排队请求", async () => {
+  const bridgeModule = await import("../agent-bridge.mjs");
+  const bridge = bridgeModule.createBridgeServer({ port: 0, token: TOKEN, requestTimeoutMs: 25 });
+  bridgeModule.routeBridgeMessages(bridge);
+  await bridge.listen();
+  const port = bridge.server.address().port;
+  const extension = await openSocket(`ws://127.0.0.1:${port}/agent?role=extension&token=${TOKEN}`);
+  const agent = await openSocket(`ws://127.0.0.1:${port}/agent?role=agent&token=${TOKEN}`);
+  extension.addEventListener("message", () => {});
+  const response = new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("Bridge 超时响应未返回")), 1000);
+    agent.addEventListener("message", (event) => {
+      const message = JSON.parse(event.data);
+      if (message.type !== "response" || message.id !== "timeout-1") return;
+      clearTimeout(timer);
+      resolve(message.result);
+    });
+  });
+  agent.send(JSON.stringify({ type: "request", id: "timeout-1", method: "getStatus" }));
+  const result = await response;
+  assert.equal(result.error.code, "EXTENSION_REQUEST_TIMEOUT");
+  const health = await (await fetch(`http://127.0.0.1:${port}/health?token=${TOKEN}`)).json();
+  assert.equal(health.queuedRequests, 0);
+  assert.equal(health.extensionConnected, false);
+  agent.close();
+  extension.close();
+  await bridge.close();
+});
+
 test("Agent CLI 的 ask 会自动启动搜索、等待完成并返回结果", async () => {
   const bridgeModule = await import("../agent-bridge.mjs");
   const bridge = bridgeModule.createBridgeServer({ port: 0, token: TOKEN });

@@ -1,4 +1,4 @@
-/* 邮人全搜本地 Agent Bridge：仅监听本机回环地址，在扩展页面与本地 Agent 之间转发版本化请求。 */
+/* 邮人全搜本地 Agent Bridge：仅监听本机回环地址，支持多 Agent 请求排队并转发版本化请求。 */
 
 import http from "node:http";
 import crypto from "node:crypto";
@@ -7,6 +7,7 @@ import process from "node:process";
 const PROTOCOL_VERSION = 1;
 const DEFAULT_HOST = "127.0.0.1";
 const DEFAULT_PORT = 17832;
+const REQUEST_TIMEOUT_MS = 30_000;
 const WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const ALLOWED_METHODS = new Set(["getCapabilities", "getStatus", "getContext", "getResourceUsage", "getFailures", "previewSearch", "setRequestProfile", "listScopes", "listBoards", "startSearch", "getResults", "pauseSearch", "resumeSearch", "retrySearch", "cancelSearch"]);
 
@@ -167,17 +168,20 @@ function upgradeSocket(request, socket, head, role, token, state) {
     }
   });
   send({ type: "connected", protocolVersion: PROTOCOL_VERSION, role });
+  state.onConnect(role);
 }
 
-function createBridgeServer({ host = DEFAULT_HOST, port = DEFAULT_PORT, token = tokenValue() } = {}) {
+function createBridgeServer({ host = DEFAULT_HOST, port = DEFAULT_PORT, token = tokenValue(), requestTimeoutMs = REQUEST_TIMEOUT_MS } = {}) {
   const state = {
     connections: { extension: null, agent: null, agents: new Set() },
     buffers: new Map(),
     pending: new Map(),
     requestQueue: [],
     requestSequence: 0,
+    requestTimeoutMs: Math.max(1, Number(requestTimeoutMs) || REQUEST_TIMEOUT_MS),
     extensionBusy: false,
     onMessage: () => {},
+    onConnect: () => {},
     onClose: () => {}
   };
   const server = http.createServer((request, response) => {
@@ -190,7 +194,7 @@ function createBridgeServer({ host = DEFAULT_HOST, port = DEFAULT_PORT, token = 
       jsonResponse(response, 401, { ok: false, error: { code: "UNAUTHORIZED", message: "Bridge 令牌无效" } });
       return;
     }
-    jsonResponse(response, 200, { ok: true, service: "byr-local-search-agent-bridge", protocolVersion: PROTOCOL_VERSION, extensionConnected: Boolean(state.connections.extension), agentConnected: state.connections.agents.size > 0, queuedRequests: state.requestQueue.length + state.pending.size });
+    jsonResponse(response, 200, { ok: true, service: "byr-local-search-agent-bridge", protocolVersion: PROTOCOL_VERSION, extensionConnected: Boolean(state.connections.extension), agentConnected: state.connections.agents.size > 0, queuedRequests: state.requestQueue.length + state.pending.size, requestTimeoutMs: state.requestTimeoutMs });
   });
   server.on("upgrade", (request, socket, head) => {
     const requestUrl = new URL(request.url || "/", `http://${request.headers.host || host}`);
@@ -216,8 +220,32 @@ function createBridgeServer({ host = DEFAULT_HOST, port = DEFAULT_PORT, token = 
 function routeBridgeMessages(bridge) {
   const { state } = bridge;
   const extensionError = { ok: false, apiVersion: 1, error: { code: "EXTENSION_DISCONNECTED", message: "邮人全搜扩展连接已断开" } };
+  const timeoutError = { ok: false, apiVersion: 1, error: { code: "EXTENSION_REQUEST_TIMEOUT", message: "扩展请求超时，Bridge 已释放队列；请稍后重试" } };
   const sendResponse = (socket, id, result) => {
     if (socket && !socket.destroyed) socket.write(frameText({ type: "response", id, result }));
+  };
+  const clearTimer = (request) => {
+    if (request?.timer) {
+      clearTimeout(request.timer);
+      request.timer = null;
+    }
+  };
+  const failQueued = (result) => {
+    for (const request of state.requestQueue) sendResponse(request.socket, request.id, result);
+    state.requestQueue.length = 0;
+  };
+  const timeoutRequest = (request) => {
+    if (!state.pending.has(request.bridgeId)) return;
+    state.pending.delete(request.bridgeId);
+    clearTimer(request);
+    state.extensionBusy = false;
+    sendResponse(request.socket, request.id, timeoutError);
+    failQueued(timeoutError);
+    const extension = state.connections.extension;
+    if (extension) {
+      state.connections.extension = null;
+      try { extension.destroy(); } catch {}
+    }
   };
   const pump = () => {
     if (state.extensionBusy || !state.connections.extension) return;
@@ -227,15 +255,21 @@ function routeBridgeMessages(bridge) {
       state.pending.set(request.bridgeId, request);
       state.extensionBusy = true;
       state.connections.extension.write(frameText({ type: "request", id: request.bridgeId, method: request.method, argument: request.argument }));
+      request.timer = setTimeout(() => timeoutRequest(request), state.requestTimeoutMs);
       return;
     }
   };
+  state.onConnect = (role) => {
+    if (role === "extension") pump();
+  };
   state.onClose = (role, socket) => {
     if (role === "extension") {
-      for (const request of state.pending.values()) sendResponse(request.socket, request.id, extensionError);
-      for (const request of state.requestQueue) sendResponse(request.socket, request.id, extensionError);
+      for (const request of state.pending.values()) {
+        clearTimer(request);
+        sendResponse(request.socket, request.id, extensionError);
+      }
+      failQueued(extensionError);
       state.pending.clear();
-      state.requestQueue.length = 0;
       state.extensionBusy = false;
       return;
     }
@@ -244,7 +278,7 @@ function routeBridgeMessages(bridge) {
   };
   state.onMessage = (role, message, send) => {
     if (message.type === "hello") {
-      send({ type: "hello", ok: true, protocolVersion: PROTOCOL_VERSION, extensionConnected: Boolean(state.connections.extension), agentConnected: state.connections.agents.size > 0, queuedRequests: state.requestQueue.length + state.pending.size });
+      send({ type: "hello", ok: true, protocolVersion: PROTOCOL_VERSION, extensionConnected: Boolean(state.connections.extension), agentConnected: state.connections.agents.size > 0, queuedRequests: state.requestQueue.length + state.pending.size, requestTimeoutMs: state.requestTimeoutMs });
       return;
     }
     if (role === "agent" && message.type === "request") {
@@ -265,6 +299,7 @@ function routeBridgeMessages(bridge) {
       if (typeof message.id !== "string" || !state.pending.has(message.id)) return;
       const request = state.pending.get(message.id);
       state.pending.delete(message.id);
+      clearTimer(request);
       state.extensionBusy = false;
       sendResponse(request.socket, request.id, message.result);
       pump();
@@ -273,7 +308,7 @@ function routeBridgeMessages(bridge) {
 }
 
 function cliHelp() {
-  return `邮人全搜 Agent Bridge（Node.js 22 或更高版本）\n\n用法：\n  node agent-bridge.mjs start [--port 17832] [--token <令牌>]\n  node agent-bridge.mjs health --port 17832 --token <令牌>\n\n说明：Bridge 只监听 127.0.0.1；请把扩展页面中的 bridgePort 和 bridgeToken 设置为相同值。\n`;
+  return `邮人全搜 Agent Bridge（Node.js 22 或更高版本）\n\n用法：\n  node agent-bridge.mjs start [--port 17832] [--token <令牌>]\n  node agent-bridge.mjs health --port 17832 --token <令牌>\n\n说明：Bridge 只监听 127.0.0.1；支持多个 Agent 连接，扩展请求按顺序处理，单个请求默认 30 秒超时。\n`;
 }
 
 async function run(argv = process.argv.slice(2)) {
@@ -305,4 +340,4 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   });
 }
 
-export { PROTOCOL_VERSION, createBridgeServer, frameText, parseArgs, parseFrames, routeBridgeMessages, tokenValue };
+export { PROTOCOL_VERSION, REQUEST_TIMEOUT_MS, createBridgeServer, frameText, parseArgs, parseFrames, routeBridgeMessages, tokenValue };
