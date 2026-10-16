@@ -14,6 +14,7 @@ test("Agent CLI 帮助信息可直接从 Node.js 输出", () => {
   assert.match(result.stdout, /Chrome DevTools Protocol/);
   assert.match(result.stdout, /node agent-cli\.mjs search/);
   assert.match(result.stdout, /node agent-cli\.mjs setup/);
+  assert.match(result.stdout, /node agent-cli\.mjs doctor --fix/);
   assert.match(result.stdout, /node agent-cli\.mjs ask/);
 });
 

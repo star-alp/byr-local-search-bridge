@@ -256,6 +256,7 @@ function cliHelp() {
 用法：
   node agent-cli.mjs setup --url "<扩展 Agent 页面 URL>"
   node agent-cli.mjs doctor
+  node agent-cli.mjs doctor --fix
   node agent-cli.mjs ask --query "<关键词>"
   node agent-cli.mjs preview --query "<关键词>"
   node agent-cli.mjs context
@@ -595,13 +596,38 @@ async function runDoctor(options) {
   return result;
 }
 
+async function runDoctorWithFix(options) {
+  let diagnosis;
+  try {
+    diagnosis = await runDoctor(options);
+  } catch (error) {
+    diagnosis = { ok: false, ready: false, checks: { config: false, bridge: false, extension: false, api: false }, message: error.message || "诊断失败" };
+  }
+  if (!options.fix || diagnosis.ready) return diagnosis;
+
+  const saved = readBridgeConfig() || {};
+  const extensionUrl = options.url || saved.extensionUrl || "";
+  if (!extensionUrl) {
+    return {
+      ...diagnosis,
+      fix: { attempted: false, applied: false, reason: "缺少扩展 Agent 页面 URL，请让 AI 先执行 setup --url" },
+      message: `${diagnosis.message || "连接尚未就绪"}；自动修复需要扩展 Agent 页面 URL`
+    };
+  }
+  try {
+    const setup = await runSetup(options);
+    const after = await runDoctor({ ...options, port: setup.port, token: undefined });
+    return { ...after, fix: { attempted: true, applied: after.ready, setup } };
+  } catch (error) {
+    return { ...diagnosis, fix: { attempted: true, applied: false, message: error.message || "自动修复失败" }, message: error.message || diagnosis.message };
+  }
+}
+
 async function run(options) {
   if (options.help) { process.stdout.write(cliHelp()); return; }
   if (options.command === "setup") { output(await runSetup(options), options.pretty); return; }
   if (options.command === "doctor") {
-    let result;
-    try { result = await runDoctor(options); }
-    catch (error) { result = { ok: false, ready: false, checks: { config: false, bridge: false, extension: false, api: false }, message: error.message || "诊断失败" }; }
+    const result = await runDoctorWithFix(options);
     output(result, options.pretty);
     return result.ready ? 0 : 1;
   }
@@ -640,4 +666,4 @@ async function main(argv = process.argv.slice(2)) {
 const isDirect = process.argv[1] && path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url));
 if (isDirect) main();
 
-export { AGENT_COMMANDS, applyChanges, blockedExtensionPageMessage, bridgeUrl, chromeExecutable, chromeProfileRoots, configFilePath, connectBridge, extensionIdFromUrl, findInstalledChromeProfile, invokeClient, parseArgs, runDoctor, searchOptions, waitForResults };
+export { AGENT_COMMANDS, applyChanges, blockedExtensionPageMessage, bridgeUrl, chromeExecutable, chromeProfileRoots, configFilePath, connectBridge, extensionIdFromUrl, findInstalledChromeProfile, invokeClient, parseArgs, runDoctor, runDoctorWithFix, searchOptions, waitForResults };
