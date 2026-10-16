@@ -1,4 +1,4 @@
-/* 邮人全搜本地 Agent CLI：支持调试 Chrome 和本机 Agent Bridge 两种连接方式。 */
+/* 邮人全搜本地 Agent CLI：支持调试 Chrome 和本机 Agent Bridge 两种连接方式，并提供预览、控制和增量输出。 */
 
 import { fileURLToPath } from "node:url";
 import path from "node:path";
@@ -176,6 +176,8 @@ function cliHelp() {
   node agent-cli.mjs setup --url "<扩展 Agent 页面 URL>"
   node agent-cli.mjs doctor
   node agent-cli.mjs ask --query "<关键词>"
+  node agent-cli.mjs preview --query "<关键词>"
+  node agent-cli.mjs context
   node agent-cli.mjs capabilities [--port 9222]
   node agent-cli.mjs capabilities --transport bridge --port 17832 --token <令牌>
   node agent-cli.mjs search --query "<关键词>" [--mode online] [--scope last-used] [--wait]
@@ -183,6 +185,9 @@ function cliHelp() {
   node agent-cli.mjs results [--cursor <游标>] [--limit 20]
   node agent-cli.mjs scopes | boards [--query <版面名称或 ID>]
   node agent-cli.mjs cancel --search-id <搜索标识>
+  node agent-cli.mjs pause --search-id <搜索标识>
+  node agent-cli.mjs resume --search-id <搜索标识>
+  node agent-cli.mjs retry --search-id <搜索标识>
 
 常用参数：
   --port 9222       Chrome DevTools Protocol 本地端口
@@ -192,6 +197,7 @@ function cliHelp() {
   --wait            搜索命令等待完成并输出最终结果
   --no-open         setup 不自动打开扩展页面
   --pretty          美化 JSON 输出
+  --stream          搜索时逐条输出新增结果，最后输出 done 事件
   --query <关键词>  搜索关键词；请使用引号包住包含空格的内容
 
 小白用户推荐：先让 AI 执行 setup，再使用 ask；端口、令牌和轮询过程会自动处理。
@@ -355,8 +361,12 @@ async function waitForResults(client, start, options) {
   while (true) {
     const page = await invokeClient(client, "getResults", { ...(cursor ? { cursor } : {}), limit });
     latest = page;
-    applyChanges(results, page.items || []);
+    const items = page.items || [];
+    applyChanges(results, items);
     cursor = page.nextCursor;
+    if (options.stream) {
+      items.forEach((item) => output({ type: item.operation === "remove" ? "remove" : "result", searchId: page.searchId, total: page.total, item }, false));
+    }
     if (options.progress) process.stderr.write(`搜索状态：${page.status} · 已找到 ${page.total} 条\n`);
     if (!page.running && !page.hasMore) break;
     await new Promise((resolve) => setTimeout(resolve, 1000));
@@ -373,7 +383,9 @@ async function runCommand(client, options) {
     const start = await invokeClient(client, "startSearch", searchOptions(options));
     if (options.command === "ask" || options.wait || options.watch) {
       const waitOptions = options.command === "ask" ? { ...options, resultLimit: options.limit === undefined ? 20 : Number(options.limit) } : options;
-      output(await waitForResults(client, start, waitOptions), options.pretty);
+      const result = await waitForResults(client, start, waitOptions);
+      if (options.stream) output({ type: "done", ...result }, false);
+      else output(result, options.pretty);
     }
     else output(start, options.pretty);
     return;
@@ -388,7 +400,18 @@ async function runCommand(client, options) {
     output(await invokeClient(client, "cancelSearch", { searchId: options["search-id"] }), options.pretty);
     return;
   }
-  const methods = { capabilities: "getCapabilities", status: "getStatus", scopes: "listScopes", boards: "listBoards" };
+  if (["pause", "resume", "retry"].includes(options.command)) {
+    if (!options["search-id"]) throw new Error(`${options.command} 需要 --search-id`);
+    const method = { pause: "pauseSearch", resume: "resumeSearch", retry: "retrySearch" }[options.command];
+    output(await invokeClient(client, method, { searchId: options["search-id"] }), options.pretty);
+    return;
+  }
+  if (options.command === "preview") {
+    if (!String(options.query || "").trim()) throw new Error("preview 需要 --query 搜索关键词");
+    output(await invokeClient(client, "previewSearch", searchOptions(options)), options.pretty);
+    return;
+  }
+  const methods = { capabilities: "getCapabilities", status: "getStatus", context: "getContext", scopes: "listScopes", boards: "listBoards" };
   const method = methods[options.command];
   if (!method) throw new Error(`无法识别命令：${options.command}`);
   const argument = options.command === "boards" && options.query ? { query: options.query } : undefined;
@@ -489,7 +512,8 @@ async function run(options) {
     output(result, options.pretty);
     return result.ready ? 0 : 1;
   }
-  const transport = options.transport || (options.command === "ask" ? "bridge" : "cdp");
+  const bridgeCommands = new Set(["ask", "preview", "context", "pause", "resume", "retry"]);
+  const transport = options.transport || (bridgeCommands.has(options.command) ? "bridge" : "cdp");
   if (!["cdp", "bridge"].includes(transport)) throw new Error("--transport 只能是 cdp 或 bridge");
   if (transport === "bridge") {
     const credentials = bridgeCredentials(options);

@@ -92,6 +92,27 @@ test("Agent CLI 可以通过 Bridge 调用扩展 API", async () => {
   await bridge.close();
 });
 
+test("Agent Bridge 转发新的上下文和任务控制方法", async () => {
+  const bridgeModule = await import("../agent-bridge.mjs");
+  const bridge = bridgeModule.createBridgeServer({ port: 0, token: TOKEN });
+  bridgeModule.routeBridgeMessages(bridge);
+  await bridge.listen();
+  const port = bridge.server.address().port;
+  const extension = await openSocket(`ws://127.0.0.1:${port}/agent?role=extension&token=${TOKEN}`);
+  extension.addEventListener("message", (event) => {
+    const message = JSON.parse(event.data);
+    if (message.type === "request") extension.send(JSON.stringify({ type: "response", id: message.id, result: { ok: true, apiVersion: 1, method: message.method } }));
+  });
+  const result = await runCli(["context", "--transport", "bridge", "--port", String(port), "--token", TOKEN]);
+  assert.equal(result.code, 0, result.stderr);
+  assert.equal(JSON.parse(result.stdout).method, "getContext");
+  const pause = await runCli(["pause", "--transport", "bridge", "--port", String(port), "--token", TOKEN, "--search-id", "search-1"]);
+  assert.equal(pause.code, 0, pause.stderr);
+  assert.equal(JSON.parse(pause.stdout).method, "pauseSearch");
+  extension.close();
+  await bridge.close();
+});
+
 test("Agent CLI 的 ask 会自动启动搜索、等待完成并返回结果", async () => {
   const bridgeModule = await import("../agent-bridge.mjs");
   const bridge = bridgeModule.createBridgeServer({ port: 0, token: TOKEN });
@@ -112,6 +133,11 @@ test("Agent CLI 的 ask 会自动启动搜索、等待完成并返回结果", as
   assert.equal(output.ok, true);
   assert.equal(output.total, 1);
   assert.equal(output.results[0].title, "课程资料");
+  const streamed = await runCli(["ask", "--transport", "bridge", "--port", String(port), "--token", TOKEN, "--query", "课程资料", "--limit", "1", "--stream"]);
+  assert.equal(streamed.code, 0, streamed.stderr);
+  const events = streamed.stdout.trim().split("\n").map((line) => JSON.parse(line));
+  assert.equal(events[0].type, "result");
+  assert.equal(events.at(-1).type, "done");
   extension.close();
   await bridge.close();
 });
