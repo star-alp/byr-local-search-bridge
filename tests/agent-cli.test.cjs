@@ -58,11 +58,14 @@ test("Agent CLI 对未安装扩展的调试 Chrome 给出中文诊断", async ()
 
 test("Agent CLI 支持选择本地 Bridge 传输", async () => {
   const file = path.join(__dirname, "..", "agent-cli.mjs");
-  const { parseArgs } = await import(`file://${file}`);
+  const { AGENT_COMMANDS, parseArgs } = await import(`file://${file}`);
   const parsed = parseArgs(["status", "--transport", "bridge", "--port", "17832", "--token", "0123456789abcdef0123456789abcdef"]);
   assert.equal(parsed.transport, "bridge");
   assert.equal(parsed.port, "17832");
   assert.equal(parsed.token, "0123456789abcdef0123456789abcdef");
+  assert.equal(AGENT_COMMANDS.has("resources"), true);
+  assert.equal(AGENT_COMMANDS.has("failures"), true);
+  assert.equal(AGENT_COMMANDS.has("request-profile"), true);
 });
 
 test("Agent CLI 能从 Windows 和 Linux Chrome 配置目录识别扩展所在 profile", async () => {

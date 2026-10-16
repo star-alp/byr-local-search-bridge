@@ -10,6 +10,8 @@ import { spawn } from "node:child_process";
 const AGENT_GLOBAL = "__BYR_LOCAL_SEARCH_AGENT_V1__";
 const DEFAULT_BRIDGE_PORT = 17832;
 const CONFIG_FILE_NAME = "bridge.json";
+// 直接调用扩展 Agent 的命令默认使用本地 Bridge，避免 AI 还要手动配置 Chrome 调试端口。
+const AGENT_COMMANDS = new Set(["ask", "preview", "context", "resources", "failures", "request-profile", "capabilities", "status", "scopes", "boards", "search", "results", "cancel", "pause", "resume", "retry"]);
 
 function configFilePath() {
   const base = process.platform === "win32"
@@ -273,7 +275,7 @@ function cliHelp() {
 
 常用参数：
   --port 9222       Chrome DevTools Protocol 本地端口
-  --transport bridge 使用本地 Agent Bridge；默认使用 CDP
+  --transport bridge 使用本地 Agent Bridge；Agent 命令默认使用 Bridge
   --token <令牌>    Agent Bridge 启动时输出的连接令牌
   --url <扩展 URL>  没有已打开的搜索页时尝试新建扩展页面
   --wait            搜索命令等待完成并输出最终结果
@@ -603,8 +605,7 @@ async function run(options) {
     output(result, options.pretty);
     return result.ready ? 0 : 1;
   }
-  const bridgeCommands = new Set(["ask", "preview", "context", "pause", "resume", "retry"]);
-  const transport = options.transport || (bridgeCommands.has(options.command) ? "bridge" : "cdp");
+  const transport = options.transport || (AGENT_COMMANDS.has(options.command) ? "bridge" : "cdp");
   if (!["cdp", "bridge"].includes(transport)) throw new Error("--transport 只能是 cdp 或 bridge");
   if (transport === "bridge") {
     const credentials = bridgeCredentials(options);
@@ -639,4 +640,4 @@ async function main(argv = process.argv.slice(2)) {
 const isDirect = process.argv[1] && path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url));
 if (isDirect) main();
 
-export { applyChanges, blockedExtensionPageMessage, bridgeUrl, chromeExecutable, chromeProfileRoots, configFilePath, connectBridge, extensionIdFromUrl, findInstalledChromeProfile, invokeClient, parseArgs, runDoctor, searchOptions, waitForResults };
+export { AGENT_COMMANDS, applyChanges, blockedExtensionPageMessage, bridgeUrl, chromeExecutable, chromeProfileRoots, configFilePath, connectBridge, extensionIdFromUrl, findInstalledChromeProfile, invokeClient, parseArgs, runDoctor, searchOptions, waitForResults };
