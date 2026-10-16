@@ -4,6 +4,8 @@ const { test } = require("node:test");
 const assert = require("node:assert/strict");
 const { spawnSync } = require("node:child_process");
 const path = require("node:path");
+const fs = require("node:fs");
+const os = require("node:os");
 
 test("Agent CLI 帮助信息可直接从 Node.js 输出", () => {
   const file = path.join(__dirname, "..", "agent-cli.mjs");
@@ -61,4 +63,19 @@ test("Agent CLI 支持选择本地 Bridge 传输", async () => {
   assert.equal(parsed.transport, "bridge");
   assert.equal(parsed.port, "17832");
   assert.equal(parsed.token, "0123456789abcdef0123456789abcdef");
+});
+
+test("Agent CLI 能从 Windows 和 Linux Chrome 配置目录识别扩展所在 profile", async () => {
+  const file = path.join(__dirname, "..", "agent-cli.mjs");
+  const { chromeProfileRoots, findInstalledChromeProfile, extensionIdFromUrl } = await import(`file://${file}`);
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), "byr-profile-"));
+  const extensionId = "abcdefghijklmnopabcdefghijklmnop";
+  const profile = path.join(temp, "Profile 7");
+  fs.mkdirSync(profile, { recursive: true });
+  fs.writeFileSync(path.join(profile, "Preferences"), JSON.stringify({ extensions: { settings: { [extensionId]: { path: "/extension" } } } }));
+  assert.equal(extensionIdFromUrl(`chrome-extension://${extensionId}/search.html`), extensionId);
+  assert.equal(chromeProfileRoots("win32", { LOCALAPPDATA: "C:\\Users\\demo\\AppData\\Local" }, "C:\\Users\\demo").some((item) => item.includes("Google")), true);
+  assert.equal(chromeProfileRoots("linux", { XDG_CONFIG_HOME: "/tmp/config" }, "/home/demo").includes("/tmp/config/google-chrome"), true);
+  assert.equal(findInstalledChromeProfile(`chrome-extension://${extensionId}/search.html`, { roots: [temp] }).profileDirectory, "Profile 7");
+  fs.rmSync(temp, { recursive: true, force: true });
 });

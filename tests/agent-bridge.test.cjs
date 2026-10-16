@@ -109,6 +109,9 @@ test("Agent Bridge 转发新的上下文和任务控制方法", async () => {
   const pause = await runCli(["pause", "--transport", "bridge", "--port", String(port), "--token", TOKEN, "--search-id", "search-1"]);
   assert.equal(pause.code, 0, pause.stderr);
   assert.equal(JSON.parse(pause.stdout).method, "pauseSearch");
+  const profile = await runCli(["request-profile", "--transport", "bridge", "--port", String(port), "--token", TOKEN, "--profile", "high"]);
+  assert.equal(profile.code, 0, profile.stderr);
+  assert.equal(JSON.parse(profile.stdout).method, "setRequestProfile");
   extension.close();
   await bridge.close();
 });

@@ -36,6 +36,74 @@ function writeBridgeConfig(value) {
   return file;
 }
 
+function uniqueValues(values) {
+  return [...new Set(values.filter(Boolean))];
+}
+
+function chromeProfileRoots(platform = process.platform, env = process.env, home = os.homedir()) {
+  if (platform === "win32") {
+    const local = env.LOCALAPPDATA || path.join(home, "AppData", "Local");
+    return uniqueValues([
+      path.join(local, "Google", "Chrome", "User Data"),
+      path.join(local, "Chromium", "User Data")
+    ]);
+  }
+  if (platform === "darwin") return [path.join(home, "Library", "Application Support", "Google", "Chrome")];
+  const config = env.XDG_CONFIG_HOME || path.join(home, ".config");
+  return uniqueValues([
+    path.join(config, "google-chrome"),
+    path.join(config, "google-chrome-unstable"),
+    path.join(config, "chromium"),
+    path.join(config, "chromium-browser")
+  ]);
+}
+
+function extensionIdFromUrl(url) {
+  const match = String(url || "").match(/^chrome-extension:\/\/([a-p]{32})\//u);
+  return match?.[1] || "";
+}
+
+function findInstalledChromeProfile(url, options = {}) {
+  const extensionId = options.extensionId || extensionIdFromUrl(url);
+  if (!extensionId) return null;
+  const roots = options.roots || chromeProfileRoots(options.platform, options.env, options.home);
+  for (const root of roots) {
+    let entries;
+    try { entries = fs.readdirSync(root, { withFileTypes: true }); } catch { continue; }
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      const preferenceFile = path.join(root, entry.name, "Preferences");
+      try {
+        const preferences = JSON.parse(fs.readFileSync(preferenceFile, "utf8"));
+        const extension = preferences.extensions?.settings?.[extensionId];
+        if (extension) return { root, profileDirectory: entry.name, extensionId };
+      } catch {
+        // Chrome 运行时可能暂时锁定或尚未写出 Preferences，继续检查其他配置。
+      }
+    }
+  }
+  return null;
+}
+
+function chromeExecutable(platform = process.platform, env = process.env, fsModule = fs) {
+  if (platform === "win32") {
+    const candidates = uniqueValues([
+      env.LOCALAPPDATA && path.join(env.LOCALAPPDATA, "Google", "Chrome", "Application", "chrome.exe"),
+      env.PROGRAMFILES && path.join(env.PROGRAMFILES, "Google", "Chrome", "Application", "chrome.exe"),
+      env["PROGRAMFILES(X86)"] && path.join(env["PROGRAMFILES(X86)"], "Google", "Chrome", "Application", "chrome.exe")
+    ]);
+    return candidates.find((candidate) => fsModule.existsSync(candidate)) || null;
+  }
+  if (platform === "linux") {
+    const pathEntries = String(env.PATH || "").split(path.delimiter).filter(Boolean);
+    for (const command of ["google-chrome", "google-chrome-stable", "chromium", "chromium-browser"]) {
+      const executable = pathEntries.map((directory) => path.join(directory, command)).find((candidate) => fsModule.existsSync(candidate));
+      if (executable) return executable;
+    }
+  }
+  return null;
+}
+
 function newToken() {
   return crypto.randomBytes(24).toString("base64url");
 }
@@ -127,14 +195,25 @@ tell targetWindow to make new tab with properties {URL:${processString(url)}}
 end tell`;
     try {
       await runProcess("osascript", ["-e", script]);
-      return;
+      return { method: "macos-chrome-window" };
     } catch {
       // AppleScript 未获授权时退回系统默认打开方式。
     }
   }
-  const command = process.platform === "win32" ? "cmd" : process.platform === "darwin" ? "open" : "xdg-open";
-  const args = process.platform === "win32" ? ["/c", "start", "", url] : [url];
-  await runProcess(command, args, true);
+  const profile = findInstalledChromeProfile(url);
+  const executable = chromeExecutable();
+  if (profile && executable) {
+    await runProcess(executable, [`--profile-directory=${profile.profileDirectory}`, url], true);
+    return { method: "chrome-profile", profileDirectory: profile.profileDirectory };
+  }
+  if (process.platform === "win32") {
+    const commandLine = `start "" "${String(url).replaceAll('"', '\\"')}"`;
+    await runProcess("cmd.exe", ["/d", "/s", "/c", commandLine], true);
+    return { method: "default-browser" };
+  }
+  const command = process.platform === "darwin" ? "open" : "xdg-open";
+  await runProcess(command, [url], true);
+  return { method: "default-browser" };
 }
 
 function bridgeCredentials(options) {
@@ -178,6 +257,9 @@ function cliHelp() {
   node agent-cli.mjs ask --query "<关键词>"
   node agent-cli.mjs preview --query "<关键词>"
   node agent-cli.mjs context
+  node agent-cli.mjs resources
+  node agent-cli.mjs failures
+  node agent-cli.mjs request-profile --profile high
   node agent-cli.mjs capabilities [--port 9222]
   node agent-cli.mjs capabilities --transport bridge --port 17832 --token <令牌>
   node agent-cli.mjs search --query "<关键词>" [--mode online] [--scope last-used] [--wait]
@@ -411,7 +493,13 @@ async function runCommand(client, options) {
     output(await invokeClient(client, "previewSearch", searchOptions(options)), options.pretty);
     return;
   }
-  const methods = { capabilities: "getCapabilities", status: "getStatus", context: "getContext", scopes: "listScopes", boards: "listBoards" };
+  if (options.command === "request-profile") {
+    const profile = String(options.profile || "");
+    if (!["stable", "fast", "high"].includes(profile)) throw new Error("request-profile 需要 --profile stable、fast 或 high");
+    output(await invokeClient(client, "setRequestProfile", { profile }), options.pretty);
+    return;
+  }
+  const methods = { capabilities: "getCapabilities", status: "getStatus", context: "getContext", resources: "getResourceUsage", failures: "getFailures", scopes: "listScopes", boards: "listBoards" };
   const method = methods[options.command];
   if (!method) throw new Error(`无法识别命令：${options.command}`);
   const argument = options.command === "boards" && options.query ? { query: options.query } : undefined;
@@ -444,8 +532,9 @@ async function runSetup(options) {
   const openedUrl = extensionUrl ? bridgeUrl(extensionUrl, selected.port, token) : "";
   const configPath = writeBridgeConfig({ port: selected.port, token, extensionUrl, updatedAt: new Date().toISOString() });
   let opened = false;
+  let openResult = null;
   if (openedUrl && !options["no-open"]) {
-    await openUrl(openedUrl);
+    openResult = await openUrl(openedUrl);
     opened = true;
     selected.health = await waitForBridge(selected.port, token, 5000);
   }
@@ -458,6 +547,8 @@ async function runSetup(options) {
     tokenSaved: true,
     reused: selected.reused,
     extensionPageOpened: opened,
+    openMethod: openResult?.method || null,
+    chromeProfile: openResult?.profileDirectory || null,
     extensionConnected: Boolean(selected.health.extensionConnected),
     configPath,
     message: selected.health.extensionConnected
@@ -548,4 +639,4 @@ async function main(argv = process.argv.slice(2)) {
 const isDirect = process.argv[1] && path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url));
 if (isDirect) main();
 
-export { applyChanges, blockedExtensionPageMessage, bridgeUrl, configFilePath, connectBridge, invokeClient, parseArgs, runDoctor, searchOptions, waitForResults };
+export { applyChanges, blockedExtensionPageMessage, bridgeUrl, chromeExecutable, chromeProfileRoots, configFilePath, connectBridge, extensionIdFromUrl, findInstalledChromeProfile, invokeClient, parseArgs, runDoctor, searchOptions, waitForResults };
