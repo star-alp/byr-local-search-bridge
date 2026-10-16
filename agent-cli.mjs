@@ -262,10 +262,10 @@ function cliHelp() {
   node agent-cli.mjs resources
   node agent-cli.mjs failures
   node agent-cli.mjs request-profile --profile high
-  node agent-cli.mjs capabilities [--port 9222]
-  node agent-cli.mjs capabilities --transport bridge --port 17832 --token <令牌>
+  node agent-cli.mjs capabilities
+  node agent-cli.mjs capabilities --transport cdp --port 9222
   node agent-cli.mjs search --query "<关键词>" [--mode online] [--scope last-used] [--wait]
-  node agent-cli.mjs status [--port 9222]
+  node agent-cli.mjs status
   node agent-cli.mjs results [--cursor <游标>] [--limit 20]
   node agent-cli.mjs scopes | boards [--query <版面名称或 ID>]
   node agent-cli.mjs cancel --search-id <搜索标识>
