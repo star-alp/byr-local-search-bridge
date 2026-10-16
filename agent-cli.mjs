@@ -91,14 +91,50 @@ function startBridgeProcess(port, token) {
   child.unref();
 }
 
-function openUrl(url) {
-  const command = process.platform === "darwin" ? "open" : process.platform === "win32" ? "cmd" : "xdg-open";
-  const args = process.platform === "win32" ? ["/c", "start", "", url] : [url];
+function processString(value) {
+  return `"${String(value).replaceAll("\\", "\\\\").replaceAll("\"", "\\\"")}"`;
+}
+
+function runProcess(command, args, detached = false) {
   return new Promise((resolve, reject) => {
-    const child = spawn(command, args, { detached: true, stdio: "ignore" });
+    const child = spawn(command, args, { detached, stdio: detached ? "ignore" : ["ignore", "ignore", "pipe"] });
     child.once("error", reject);
-    child.once("spawn", () => { child.unref(); resolve(); });
+    if (detached) {
+      child.once("spawn", () => { child.unref(); resolve(); });
+      return;
+    }
+    child.once("close", (code) => code === 0 ? resolve() : reject(new Error(`${command} 返回状态 ${code}`)));
   });
+}
+
+async function openUrl(url) {
+  if (process.platform === "darwin" && url.startsWith("chrome-extension://")) {
+    const extensionPrefix = url.slice(0, url.indexOf("/search.html") + 1);
+    const script = `tell application "Google Chrome"
+activate
+set targetWindow to missing value
+repeat with currentWindow in windows
+  repeat with currentTab in tabs of currentWindow
+    if ((URL of currentTab) starts with ${processString(extensionPrefix)}) then
+      set targetWindow to contents of currentWindow
+      exit repeat
+    end if
+  end repeat
+  if targetWindow is not missing value then exit repeat
+end repeat
+if targetWindow is missing value then set targetWindow to front window
+tell targetWindow to make new tab with properties {URL:${processString(url)}}
+end tell`;
+    try {
+      await runProcess("osascript", ["-e", script]);
+      return;
+    } catch {
+      // AppleScript 未获授权时退回系统默认打开方式。
+    }
+  }
+  const command = process.platform === "win32" ? "cmd" : process.platform === "darwin" ? "open" : "xdg-open";
+  const args = process.platform === "win32" ? ["/c", "start", "", url] : [url];
+  await runProcess(command, args, true);
 }
 
 function bridgeCredentials(options) {
