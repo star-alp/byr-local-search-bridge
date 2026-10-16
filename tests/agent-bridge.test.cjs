@@ -116,6 +116,46 @@ test("Agent Bridge 转发新的上下文和任务控制方法", async () => {
   await bridge.close();
 });
 
+test("Agent Bridge 支持多个 Agent 连接并按顺序处理请求", async () => {
+  const bridgeModule = await import("../agent-bridge.mjs");
+  const bridge = bridgeModule.createBridgeServer({ port: 0, token: TOKEN });
+  bridgeModule.routeBridgeMessages(bridge);
+  await bridge.listen();
+  const port = bridge.server.address().port;
+  const extension = await openSocket(`ws://127.0.0.1:${port}/agent?role=extension&token=${TOKEN}`);
+  const agentA = await openSocket(`ws://127.0.0.1:${port}/agent?role=agent&token=${TOKEN}`);
+  const agentB = await openSocket(`ws://127.0.0.1:${port}/agent?role=agent&token=${TOKEN}`);
+  const methods = [];
+  extension.addEventListener("message", (event) => {
+    const message = JSON.parse(event.data);
+    if (message.type !== "request") return;
+    methods.push(message.method);
+    const delay = methods.length === 1 ? 50 : 0;
+    setTimeout(() => extension.send(JSON.stringify({ type: "response", id: message.id, result: { ok: true, apiVersion: 1, method: message.method } })), delay);
+  });
+  const request = (socket, id, method) => new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("Bridge 多 Agent 请求超时")), 1000);
+    socket.addEventListener("message", (event) => {
+      const message = JSON.parse(event.data);
+      if (message.type !== "response" || message.id !== id) return;
+      clearTimeout(timer);
+      resolve(message.result);
+    });
+    socket.send(JSON.stringify({ type: "request", id, method }));
+  });
+  const [resultA, resultB] = await Promise.all([request(agentA, "agent-a", "getStatus"), request(agentB, "agent-b", "getContext")]);
+  assert.equal(resultA.method, "getStatus");
+  assert.equal(resultB.method, "getContext");
+  assert.deepEqual(methods, ["getStatus", "getContext"]);
+  const health = await (await fetch(`http://127.0.0.1:${port}/health?token=${TOKEN}`)).json();
+  assert.equal(health.agentConnected, true);
+  assert.equal(health.queuedRequests, 0);
+  extension.close();
+  agentA.close();
+  agentB.close();
+  await bridge.close();
+});
+
 test("Agent CLI 的 ask 会自动启动搜索、等待完成并返回结果", async () => {
   const bridgeModule = await import("../agent-bridge.mjs");
   const bridge = bridgeModule.createBridgeServer({ port: 0, token: TOKEN });

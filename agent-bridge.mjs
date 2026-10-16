@@ -123,20 +123,28 @@ function upgradeSocket(request, socket, head, role, token, state) {
   socket.setNoDelay(true);
   if (head?.length) socket.emit("data", head);
 
-  const previous = state.connections[role];
-  if (previous) {
-    try { previous.write(closeFrame()); } catch {}
-    previous.destroy();
+  if (role === "extension") {
+    const previous = state.connections.extension;
+    if (previous) {
+      state.connections.extension = null;
+      state.onClose("extension", previous);
+      try { previous.write(closeFrame()); } catch {}
+      previous.destroy();
+    }
+    state.connections.extension = socket;
+  } else {
+    state.connections.agents.add(socket);
+    state.connections.agent = socket;
   }
-  state.connections[role] = socket;
-  state.buffers[role] = Buffer.alloc(0);
+  state.buffers.set(socket, Buffer.alloc(0));
   const send = (message) => { if (!socket.destroyed) socket.write(frameText(message)); };
+  send.socket = socket;
   socket.on("data", (chunk) => {
-    state.buffers[role] = Buffer.concat([state.buffers[role], chunk]);
+    state.buffers.set(socket, Buffer.concat([state.buffers.get(socket) || Buffer.alloc(0), chunk]));
     let parsed;
-    try { parsed = parseFrames(state.buffers[role]); }
+    try { parsed = parseFrames(state.buffers.get(socket)); }
     catch { socket.destroy(); return; }
-    state.buffers[role] = parsed.rest;
+    state.buffers.set(socket, parsed.rest);
     for (const frame of parsed.frames) {
       if (frame.opcode === 0x8) { socket.end(closeFrame()); return; }
       if (frame.opcode === 0x9) { socket.write(Buffer.concat([Buffer.from([0x8a, frame.payload.length]), frame.payload])); continue; }
@@ -148,10 +156,14 @@ function upgradeSocket(request, socket, head, role, token, state) {
     }
   });
   socket.on("close", () => {
-    if (state.connections[role] === socket) {
-      state.connections[role] = null;
-      state.buffers[role] = Buffer.alloc(0);
-      state.onClose(role);
+    state.buffers.delete(socket);
+    if (role === "extension" && state.connections.extension === socket) {
+      state.connections.extension = null;
+      state.onClose(role, socket);
+    } else if (role === "agent") {
+      state.connections.agents.delete(socket);
+      if (state.connections.agent === socket) state.connections.agent = [...state.connections.agents].at(-1) || null;
+      state.onClose(role, socket);
     }
   });
   send({ type: "connected", protocolVersion: PROTOCOL_VERSION, role });
@@ -159,9 +171,12 @@ function upgradeSocket(request, socket, head, role, token, state) {
 
 function createBridgeServer({ host = DEFAULT_HOST, port = DEFAULT_PORT, token = tokenValue() } = {}) {
   const state = {
-    connections: { extension: null, agent: null },
-    buffers: { extension: Buffer.alloc(0), agent: Buffer.alloc(0) },
+    connections: { extension: null, agent: null, agents: new Set() },
+    buffers: new Map(),
     pending: new Map(),
+    requestQueue: [],
+    requestSequence: 0,
+    extensionBusy: false,
     onMessage: () => {},
     onClose: () => {}
   };
@@ -175,7 +190,7 @@ function createBridgeServer({ host = DEFAULT_HOST, port = DEFAULT_PORT, token = 
       jsonResponse(response, 401, { ok: false, error: { code: "UNAUTHORIZED", message: "Bridge 令牌无效" } });
       return;
     }
-    jsonResponse(response, 200, { ok: true, service: "byr-local-search-agent-bridge", protocolVersion: PROTOCOL_VERSION, extensionConnected: Boolean(state.connections.extension), agentConnected: Boolean(state.connections.agent) });
+    jsonResponse(response, 200, { ok: true, service: "byr-local-search-agent-bridge", protocolVersion: PROTOCOL_VERSION, extensionConnected: Boolean(state.connections.extension), agentConnected: state.connections.agents.size > 0, queuedRequests: state.requestQueue.length + state.pending.size });
   });
   server.on("upgrade", (request, socket, head) => {
     const requestUrl = new URL(request.url || "/", `http://${request.headers.host || host}`);
@@ -191,7 +206,8 @@ function createBridgeServer({ host = DEFAULT_HOST, port = DEFAULT_PORT, token = 
     server.listen(port, host);
   });
   const close = () => new Promise((resolve) => {
-    for (const socket of Object.values(state.connections)) if (socket && !socket.destroyed) socket.end(closeFrame());
+    const sockets = [state.connections.extension, ...state.connections.agents];
+    for (const socket of new Set(sockets)) if (socket && !socket.destroyed) socket.end(closeFrame());
     server.close(() => resolve());
   });
   return { server, state, host, port, token, listen, close };
@@ -199,15 +215,36 @@ function createBridgeServer({ host = DEFAULT_HOST, port = DEFAULT_PORT, token = 
 
 function routeBridgeMessages(bridge) {
   const { state } = bridge;
-  state.onClose = (role) => {
-    if (role === "extension" && state.connections.agent) {
-      for (const id of state.pending.keys()) state.connections.agent.write(frameText({ type: "response", id, result: { ok: false, apiVersion: 1, error: { code: "EXTENSION_DISCONNECTED", message: "邮人全搜扩展连接已断开" } } }));
+  const extensionError = { ok: false, apiVersion: 1, error: { code: "EXTENSION_DISCONNECTED", message: "邮人全搜扩展连接已断开" } };
+  const sendResponse = (socket, id, result) => {
+    if (socket && !socket.destroyed) socket.write(frameText({ type: "response", id, result }));
+  };
+  const pump = () => {
+    if (state.extensionBusy || !state.connections.extension) return;
+    while (state.requestQueue.length) {
+      const request = state.requestQueue.shift();
+      if (!request.socket || request.socket.destroyed) continue;
+      state.pending.set(request.bridgeId, request);
+      state.extensionBusy = true;
+      state.connections.extension.write(frameText({ type: "request", id: request.bridgeId, method: request.method, argument: request.argument }));
+      return;
     }
-    state.pending.clear();
+  };
+  state.onClose = (role, socket) => {
+    if (role === "extension") {
+      for (const request of state.pending.values()) sendResponse(request.socket, request.id, extensionError);
+      for (const request of state.requestQueue) sendResponse(request.socket, request.id, extensionError);
+      state.pending.clear();
+      state.requestQueue.length = 0;
+      state.extensionBusy = false;
+      return;
+    }
+    state.requestQueue = state.requestQueue.filter((request) => request.socket !== socket);
+    for (const request of state.pending.values()) if (request.socket === socket) request.socket = null;
   };
   state.onMessage = (role, message, send) => {
     if (message.type === "hello") {
-      send({ type: "hello", ok: true, protocolVersion: PROTOCOL_VERSION, extensionConnected: Boolean(state.connections.extension), agentConnected: Boolean(state.connections.agent) });
+      send({ type: "hello", ok: true, protocolVersion: PROTOCOL_VERSION, extensionConnected: Boolean(state.connections.extension), agentConnected: state.connections.agents.size > 0, queuedRequests: state.requestQueue.length + state.pending.size });
       return;
     }
     if (role === "agent" && message.type === "request") {
@@ -219,14 +256,18 @@ function routeBridgeMessages(bridge) {
         send({ type: "response", id: message.id, result: { ok: false, apiVersion: 1, error: { code: "EXTENSION_NOT_CONNECTED", message: "邮人全搜扩展尚未连接，请先在浏览器打开带 Bridge 参数的扩展页面" } } });
         return;
       }
-      state.pending.set(message.id, state.connections.agent);
-      state.connections.extension.write(frameText({ type: "request", id: message.id, method: message.method, argument: message.argument }));
+      const request = { bridgeId: `bridge-${Date.now().toString(36)}-${++state.requestSequence}`, socket: send.socket || state.connections.agent, id: message.id, method: message.method, argument: message.argument };
+      state.requestQueue.push(request);
+      pump();
       return;
     }
-    if (role === "extension" && message.type === "response" && state.connections.agent) {
+    if (role === "extension" && message.type === "response") {
       if (typeof message.id !== "string" || !state.pending.has(message.id)) return;
+      const request = state.pending.get(message.id);
       state.pending.delete(message.id);
-      state.connections.agent.write(frameText({ type: "response", id: message.id, result: message.result }));
+      state.extensionBusy = false;
+      sendResponse(request.socket, request.id, message.result);
+      pump();
     }
   };
 }
