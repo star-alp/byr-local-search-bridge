@@ -106,6 +106,12 @@ test("Agent Bridge 转发新的上下文和任务控制方法", async () => {
   const result = await runCli(["context", "--transport", "bridge", "--port", String(port), "--token", TOKEN]);
   assert.equal(result.code, 0, result.stderr);
   assert.equal(JSON.parse(result.stdout).method, "getContext");
+  const tasks = await runCli(["tasks", "--transport", "bridge", "--port", String(port), "--token", TOKEN]);
+  assert.equal(tasks.code, 0, tasks.stderr);
+  assert.equal(JSON.parse(tasks.stdout).method, "listTasks");
+  const task = await runCli(["task", "--transport", "bridge", "--port", String(port), "--token", TOKEN, "--search-id", "task-1"]);
+  assert.equal(task.code, 0, task.stderr);
+  assert.equal(JSON.parse(task.stdout).method, "getTask");
   const pause = await runCli(["pause", "--transport", "bridge", "--port", String(port), "--token", TOKEN, "--search-id", "search-1"]);
   assert.equal(pause.code, 0, pause.stderr);
   assert.equal(JSON.parse(pause.stdout).method, "pauseSearch");
@@ -244,7 +250,11 @@ test("Agent CLI 的 ask 会自动启动搜索、等待完成并返回结果", as
   assert.equal(streamed.code, 0, streamed.stderr);
   const events = streamed.stdout.trim().split("\n").map((line) => JSON.parse(line));
   assert.equal(events[0].type, "result");
+  assert.equal(events[0].schemaVersion, 1);
   assert.equal(events.at(-1).type, "done");
+  const formatted = await runCli(["ask", "--transport", "bridge", "--port", String(port), "--token", TOKEN, "--query", "课程资料", "--limit", "1", "--format", "jsonl"]);
+  assert.equal(formatted.code, 0, formatted.stderr);
+  assert.equal(JSON.parse(formatted.stdout.trim().split("\n").at(-1)).type, "done");
   extension.close();
   await bridge.close();
 });

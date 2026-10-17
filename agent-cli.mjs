@@ -11,9 +11,9 @@ const AGENT_GLOBAL = "__BYR_LOCAL_SEARCH_AGENT_V1__";
 const DEFAULT_BRIDGE_PORT = 17832;
 const CONFIG_FILE_NAME = "bridge.json";
 // 直接调用扩展 Agent 的命令默认使用本地 Bridge，避免 AI 还要手动配置 Chrome 调试端口。
-const AGENT_COMMANDS = new Set(["ask", "preview", "context", "resources", "failures", "request-profile", "capabilities", "status", "scopes", "boards", "search", "results", "cancel", "pause", "resume", "retry"]);
+const AGENT_COMMANDS = new Set(["ask", "preview", "context", "resources", "failures", "tasks", "task", "request-profile", "capabilities", "status", "scopes", "boards", "search", "results", "cancel", "pause", "resume", "retry"]);
 // 只对幂等读取请求自动重试，避免 startSearch、暂停和保存类操作被重复执行。
-const RETRYABLE_BRIDGE_METHODS = new Set(["getCapabilities", "getStatus", "getContext", "getResourceUsage", "getFailures", "previewSearch", "listScopes", "listBoards", "getResults"]);
+const RETRYABLE_BRIDGE_METHODS = new Set(["getCapabilities", "getStatus", "getContext", "getResourceUsage", "getFailures", "listTasks", "getTask", "previewSearch", "listScopes", "listBoards", "getResults"]);
 const BRIDGE_RETRY_DELAYS_MS = Object.freeze([500, 1500]);
 
 function configFilePath() {
@@ -265,6 +265,8 @@ function cliHelp() {
   node agent-cli.mjs context
   node agent-cli.mjs resources
   node agent-cli.mjs failures
+  node agent-cli.mjs tasks
+  node agent-cli.mjs task --search-id <任务标识>
   node agent-cli.mjs request-profile --profile high
   node agent-cli.mjs capabilities
   node agent-cli.mjs capabilities --transport cdp --port 9222
@@ -285,6 +287,7 @@ function cliHelp() {
   --wait            搜索命令等待完成并输出最终结果
   --no-open         setup 不自动打开扩展页面
   --pretty          美化 JSON 输出
+  --format json     输出单个 JSON；使用 jsonl 时每行输出一个 JSON 对象
   --stream          搜索时逐条输出新增结果，最后输出 done 事件
   --query <关键词>  搜索关键词；请使用引号包住包含空格的内容
 
@@ -293,7 +296,11 @@ function cliHelp() {
 `;
 }
 
-function output(value, pretty = false) {
+function output(value, pretty = false, format = "json") {
+  if (format === "jsonl") {
+    process.stdout.write(`${JSON.stringify(value)}\n`);
+    return;
+  }
   process.stdout.write(`${JSON.stringify(value, null, pretty ? 2 : 0)}\n`);
 }
 
@@ -493,7 +500,7 @@ async function waitForResults(client, start, options) {
     applyChanges(results, items);
     cursor = page.nextCursor;
     if (options.stream) {
-      items.forEach((item) => output({ type: item.operation === "remove" ? "remove" : "result", searchId: page.searchId, total: page.total, item }, false));
+      items.forEach((item) => output({ schemaVersion: 1, type: item.operation === "remove" ? "remove" : "result", searchId: page.searchId, total: page.total, item }, false, "jsonl"));
     }
     if (options.progress) process.stderr.write(`搜索状态：${page.status} · 已找到 ${page.total} 条\n`);
     if (!page.running && !page.hasMore) break;
@@ -502,7 +509,17 @@ async function waitForResults(client, start, options) {
   const status = await invokeClient(client, "getStatus");
   const resultLimit = options.resultLimit === undefined ? undefined : numberOption(options, "resultLimit", 20, 1, 100);
   const items = [...results.values()];
-  return { ok: true, searchId: start.searchId || latest.searchId, status, total: results.size, results: resultLimit ? items.slice(0, resultLimit) : items };
+  const summaryStatus = status.status || latest.status || "unknown";
+  const failures = Number(status.progress?.failures ?? status.failures ?? 0) || 0;
+  return {
+    schemaVersion: 1,
+    ok: true,
+    searchId: start.searchId || latest.searchId,
+    status,
+    summary: { status: summaryStatus, running: Boolean(status.running), total: results.size, failures, partial: summaryStatus === "partial" || failures > 0 },
+    total: results.size,
+    results: resultLimit ? items.slice(0, resultLimit) : items
+  };
 }
 
 async function runCommand(client, options) {
@@ -510,46 +527,54 @@ async function runCommand(client, options) {
     if (options.command === "ask" && !String(options.query || "").trim()) throw new Error("ask 需要 --query 搜索关键词");
     const start = await invokeClient(client, "startSearch", searchOptions(options));
     if (options.command === "ask" || options.wait || options.watch) {
-      const waitOptions = options.command === "ask" ? { ...options, resultLimit: options.limit === undefined ? 20 : Number(options.limit) } : options;
+      const streaming = Boolean(options.stream || (options.command === "ask" && options.format === "jsonl"));
+      const waitOptions = options.command === "ask"
+        ? { ...options, stream: streaming, resultLimit: options.limit === undefined ? 20 : Number(options.limit) }
+        : { ...options, stream: Boolean(options.stream) };
       const result = await waitForResults(client, start, waitOptions);
-      if (options.stream) output({ type: "done", ...result }, false);
-      else output(result, options.pretty);
+      if (streaming) output({ schemaVersion: 1, type: "done", ...result }, false, "jsonl");
+      else output(result, options.pretty, options.format || "json");
     }
-    else output(start, options.pretty);
+    else output(start, options.pretty, options.format || "json");
     return;
   }
   if (options.command === "results") {
     const limit = numberOption(options, "limit", 20, 1, 100);
-    output(await invokeClient(client, "getResults", { ...(options.cursor ? { cursor: options.cursor } : {}), limit }), options.pretty);
+    output(await invokeClient(client, "getResults", { ...(options.cursor ? { cursor: options.cursor } : {}), limit }), options.pretty, options.format || "json");
     return;
   }
   if (options.command === "cancel") {
     if (!options["search-id"]) throw new Error("cancel 需要 --search-id");
-    output(await invokeClient(client, "cancelSearch", { searchId: options["search-id"] }), options.pretty);
+    output(await invokeClient(client, "cancelSearch", { searchId: options["search-id"] }), options.pretty, options.format || "json");
     return;
   }
   if (["pause", "resume", "retry"].includes(options.command)) {
     if (!options["search-id"]) throw new Error(`${options.command} 需要 --search-id`);
     const method = { pause: "pauseSearch", resume: "resumeSearch", retry: "retrySearch" }[options.command];
-    output(await invokeClient(client, method, { searchId: options["search-id"] }), options.pretty);
+    output(await invokeClient(client, method, { searchId: options["search-id"] }), options.pretty, options.format || "json");
     return;
   }
   if (options.command === "preview") {
     if (!String(options.query || "").trim()) throw new Error("preview 需要 --query 搜索关键词");
-    output(await invokeClient(client, "previewSearch", searchOptions(options)), options.pretty);
+    output(await invokeClient(client, "previewSearch", searchOptions(options)), options.pretty, options.format || "json");
     return;
   }
   if (options.command === "request-profile") {
     const profile = String(options.profile || "");
     if (!["stable", "fast", "high"].includes(profile)) throw new Error("request-profile 需要 --profile stable、fast 或 high");
-    output(await invokeClient(client, "setRequestProfile", { profile }), options.pretty);
+    output(await invokeClient(client, "setRequestProfile", { profile }), options.pretty, options.format || "json");
     return;
   }
-  const methods = { capabilities: "getCapabilities", status: "getStatus", context: "getContext", resources: "getResourceUsage", failures: "getFailures", scopes: "listScopes", boards: "listBoards" };
+  if (options.command === "task") {
+    if (!options["search-id"]) throw new Error("task 需要 --search-id");
+    output(await invokeClient(client, "getTask", { searchId: options["search-id"] }), options.pretty, options.format || "json");
+    return;
+  }
+  const methods = { capabilities: "getCapabilities", status: "getStatus", context: "getContext", resources: "getResourceUsage", failures: "getFailures", tasks: "listTasks", scopes: "listScopes", boards: "listBoards" };
   const method = methods[options.command];
   if (!method) throw new Error(`无法识别命令：${options.command}`);
   const argument = options.command === "boards" && options.query ? { query: options.query } : undefined;
-  output(await invokeClient(client, method, argument), options.pretty);
+  output(await invokeClient(client, method, argument), options.pretty, options.format || "json");
 }
 
 async function runSetup(options) {
@@ -668,10 +693,11 @@ async function runDoctorWithFix(options) {
 
 async function run(options) {
   if (options.help) { process.stdout.write(cliHelp()); return; }
-  if (options.command === "setup") { output(await runSetup(options), options.pretty); return; }
+  if (options.format !== undefined && !["json", "jsonl"].includes(options.format)) throw new Error("--format 只能是 json 或 jsonl");
+  if (options.command === "setup") { output(await runSetup(options), options.pretty, options.format || "json"); return; }
   if (options.command === "doctor") {
     const result = await runDoctorWithFix(options);
-    output(result, options.pretty);
+    output(result, options.pretty, options.format || "json");
     return result.ready ? 0 : 1;
   }
   const transport = options.transport || (AGENT_COMMANDS.has(options.command) ? "bridge" : "cdp");
