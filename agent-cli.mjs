@@ -11,9 +11,9 @@ const AGENT_GLOBAL = "__BYR_LOCAL_SEARCH_AGENT_V1__";
 const DEFAULT_BRIDGE_PORT = 17832;
 const CONFIG_FILE_NAME = "bridge.json";
 // 直接调用扩展 Agent 的命令默认使用本地 Bridge，避免 AI 还要手动配置 Chrome 调试端口。
-const AGENT_COMMANDS = new Set(["ask", "preview", "context", "resources", "failures", "tasks", "task", "request-profile", "capabilities", "status", "scopes", "boards", "search", "results", "cancel", "pause", "resume", "retry"]);
+const AGENT_COMMANDS = new Set(["ask", "guide", "preview", "context", "resources", "failures", "tasks", "task", "request-profile", "capabilities", "status", "scopes", "boards", "search", "results", "cancel", "pause", "resume", "retry"]);
 // 只对幂等读取请求自动重试，避免 startSearch、暂停和保存类操作被重复执行。
-const RETRYABLE_BRIDGE_METHODS = new Set(["getCapabilities", "getStatus", "getContext", "getResourceUsage", "getFailures", "localSearch", "listTasks", "getTask", "previewSearch", "listScopes", "listBoards", "getResults"]);
+const RETRYABLE_BRIDGE_METHODS = new Set(["getCapabilities", "getStatus", "getContext", "getGuide", "getResourceUsage", "getFailures", "localSearch", "listTasks", "getTask", "previewSearch", "listScopes", "listBoards", "getResults"]);
 const BRIDGE_RETRY_DELAYS_MS = Object.freeze([500, 1500]);
 
 function configFilePath() {
@@ -260,6 +260,8 @@ function cliHelp() {
   node agent-cli.mjs setup --url "<扩展 Agent 页面 URL>"
   node agent-cli.mjs doctor
   node agent-cli.mjs doctor --fix
+  node agent-cli.mjs guide
+  node agent-cli.mjs guide --query "<关键词>"
   node agent-cli.mjs ask --query "<关键词>"
   node agent-cli.mjs ask --query "<关键词>" --mode local
   node agent-cli.mjs ask --query "<关键词>" --mode auto
@@ -293,10 +295,10 @@ function cliHelp() {
   --stream          搜索时逐条输出新增结果，最后输出 done 事件
   --query <关键词>  搜索关键词；请使用引号包住包含空格的内容
 
-本地搜索不会访问论坛；auto 表示本地优先，由 AI 根据索引状态决定是否另行发起 online 搜索。
+guide 会一次返回当前连接、范围、索引、任务和推荐下一步；本地搜索不会访问论坛；auto 表示本地优先，由 AI 根据索引状态决定是否另行发起 online 搜索。
 
 只读状态、资源和结果请求遇到 Bridge 临时断线时会自动重试；启动、暂停、继续和重试任务不会自动重复执行。
-小白用户推荐：先让 AI 执行 setup，再使用 ask；端口、令牌和轮询过程会自动处理。
+小白用户推荐：先让 AI 执行 setup、doctor、guide，再使用 ask；端口、令牌和轮询过程会自动处理。
 `;
 }
 
@@ -594,10 +596,10 @@ async function runCommand(client, options) {
     output(await invokeClient(client, "getTask", { searchId: options["search-id"] }), options.pretty, options.format || "json");
     return;
   }
-  const methods = { capabilities: "getCapabilities", status: "getStatus", context: "getContext", resources: "getResourceUsage", failures: "getFailures", tasks: "listTasks", scopes: "listScopes", boards: "listBoards" };
+  const methods = { capabilities: "getCapabilities", status: "getStatus", context: "getContext", guide: "getGuide", resources: "getResourceUsage", failures: "getFailures", tasks: "listTasks", scopes: "listScopes", boards: "listBoards" };
   const method = methods[options.command];
   if (!method) throw new Error(`无法识别命令：${options.command}`);
-  const argument = options.command === "boards" && options.query ? { query: options.query } : undefined;
+  const argument = ["boards", "guide"].includes(options.command) && options.query ? { query: options.query } : undefined;
   output(await invokeClient(client, method, argument), options.pretty, options.format || "json");
 }
 
@@ -677,6 +679,14 @@ async function runDoctor(options) {
   try {
     const capabilities = await client.request("getCapabilities");
     result.checks.api = Boolean(capabilities.ok && capabilities.ready);
+    if (result.checks.api && capabilities.methods?.getGuide) {
+      try {
+        const guide = await client.request("getGuide");
+        if (guide.ok) result.guide = guide.guide;
+      } catch (error) {
+        result.guideError = error.message || "无法读取 Agent 接手引导";
+      }
+    }
   } catch (error) {
     result.message = error.message || "无法调用扩展 Agent API";
     return result;

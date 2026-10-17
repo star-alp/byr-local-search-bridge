@@ -9,7 +9,7 @@ const DEFAULT_HOST = "127.0.0.1";
 const DEFAULT_PORT = 17832;
 const REQUEST_TIMEOUT_MS = 30_000;
 const WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
-const ALLOWED_METHODS = new Set(["getCapabilities", "getStatus", "getContext", "getResourceUsage", "getFailures", "localSearch", "listTasks", "getTask", "previewSearch", "setRequestProfile", "listScopes", "listBoards", "startSearch", "getResults", "pauseSearch", "resumeSearch", "retrySearch", "cancelSearch"]);
+const ALLOWED_METHODS = new Set(["getCapabilities", "getStatus", "getContext", "getGuide", "getResourceUsage", "getFailures", "localSearch", "listTasks", "getTask", "previewSearch", "setRequestProfile", "listScopes", "listBoards", "startSearch", "getResults", "pauseSearch", "resumeSearch", "retrySearch", "cancelSearch"]);
 
 function parseArgs(argv) {
   const [first, ...rest] = argv;

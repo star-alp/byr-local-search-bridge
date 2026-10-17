@@ -109,6 +109,9 @@ test("Agent Bridge 转发新的上下文和任务控制方法", async () => {
   const tasks = await runCli(["tasks", "--transport", "bridge", "--port", String(port), "--token", TOKEN]);
   assert.equal(tasks.code, 0, tasks.stderr);
   assert.equal(JSON.parse(tasks.stdout).method, "listTasks");
+  const guide = await runCli(["guide", "--transport", "bridge", "--port", String(port), "--token", TOKEN, "--query", "课程资料"]);
+  assert.equal(guide.code, 0, guide.stderr);
+  assert.equal(JSON.parse(guide.stdout).method, "getGuide");
   const task = await runCli(["task", "--transport", "bridge", "--port", String(port), "--token", TOKEN, "--search-id", "task-1"]);
   assert.equal(task.code, 0, task.stderr);
   assert.equal(JSON.parse(task.stdout).method, "getTask");

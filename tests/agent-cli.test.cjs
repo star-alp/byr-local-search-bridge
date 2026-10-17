@@ -15,6 +15,7 @@ test("Agent CLI 帮助信息可直接从 Node.js 输出", () => {
   assert.match(result.stdout, /node agent-cli\.mjs search/);
   assert.match(result.stdout, /node agent-cli\.mjs setup/);
   assert.match(result.stdout, /node agent-cli\.mjs doctor --fix/);
+  assert.match(result.stdout, /node agent-cli\.mjs guide/);
   assert.match(result.stdout, /node agent-cli\.mjs ask/);
 });
 
@@ -67,6 +68,7 @@ test("Agent CLI 支持选择本地 Bridge 传输", async () => {
   assert.equal(AGENT_COMMANDS.has("resources"), true);
   assert.equal(AGENT_COMMANDS.has("failures"), true);
   assert.equal(AGENT_COMMANDS.has("request-profile"), true);
+  assert.equal(AGENT_COMMANDS.has("guide"), true);
 });
 
 test("Agent CLI 能从 Windows 和 Linux Chrome 配置目录识别扩展所在 profile", async () => {

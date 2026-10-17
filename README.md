@@ -19,6 +19,14 @@ node agent-cli.mjs doctor
 
 `setup` 会自动启动 Bridge、记住本机配置，并尝试在安装扩展的 Chrome 用户配置中打开正确页面。用户不需要手动填写端口或令牌。`doctor` 会检查 Bridge、扩展 WebSocket 和 Agent API 是否都已准备好。
 
+连接成功后，Agent 可以先执行一次：
+
+```bash
+node agent-cli.mjs guide --pretty
+```
+
+`guide` 会一次返回当前连接、已选版面、索引数量、请求强度、正在进行的任务和推荐下一步命令。它是 Agent 接手扩展时的首选入口；`doctor` 成功时也会附带同样的引导信息。
+
 ## 最常用的搜索命令
 
 ```bash
