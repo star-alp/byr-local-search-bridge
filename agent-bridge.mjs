@@ -9,7 +9,7 @@ const DEFAULT_HOST = "127.0.0.1";
 const DEFAULT_PORT = 17832;
 const REQUEST_TIMEOUT_MS = 30_000;
 const WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
-const ALLOWED_METHODS = new Set(["getCapabilities", "getStatus", "getContext", "getResourceUsage", "getFailures", "listTasks", "getTask", "previewSearch", "setRequestProfile", "listScopes", "listBoards", "startSearch", "getResults", "pauseSearch", "resumeSearch", "retrySearch", "cancelSearch"]);
+const ALLOWED_METHODS = new Set(["getCapabilities", "getStatus", "getContext", "getResourceUsage", "getFailures", "localSearch", "listTasks", "getTask", "previewSearch", "setRequestProfile", "listScopes", "listBoards", "startSearch", "getResults", "pauseSearch", "resumeSearch", "retrySearch", "cancelSearch"]);
 
 function parseArgs(argv) {
   const [first, ...rest] = argv;
@@ -238,6 +238,11 @@ function routeBridgeMessages(bridge) {
     if (!state.pending.has(request.bridgeId)) return;
     state.pending.delete(request.bridgeId);
     clearTimer(request);
+    // 本地查询没有副作用，允许超时请求单独失败，不影响正在进行的在线任务队列。
+    if (request.parallel) {
+      sendResponse(request.socket, request.id, timeoutError);
+      return;
+    }
     state.extensionBusy = false;
     sendResponse(request.socket, request.id, timeoutError);
     failQueued(timeoutError);
@@ -247,15 +252,18 @@ function routeBridgeMessages(bridge) {
       try { extension.destroy(); } catch {}
     }
   };
+  const dispatch = (request) => {
+    state.pending.set(request.bridgeId, request);
+    state.connections.extension.write(frameText({ type: "request", id: request.bridgeId, method: request.method, argument: request.argument }));
+    request.timer = setTimeout(() => timeoutRequest(request), state.requestTimeoutMs);
+  };
   const pump = () => {
     if (state.extensionBusy || !state.connections.extension) return;
     while (state.requestQueue.length) {
       const request = state.requestQueue.shift();
       if (!request.socket || request.socket.destroyed) continue;
-      state.pending.set(request.bridgeId, request);
       state.extensionBusy = true;
-      state.connections.extension.write(frameText({ type: "request", id: request.bridgeId, method: request.method, argument: request.argument }));
-      request.timer = setTimeout(() => timeoutRequest(request), state.requestTimeoutMs);
+      dispatch(request);
       return;
     }
   };
@@ -291,6 +299,12 @@ function routeBridgeMessages(bridge) {
         return;
       }
       const request = { bridgeId: `bridge-${Date.now().toString(36)}-${++state.requestSequence}`, socket: send.socket || state.connections.agent, id: message.id, method: message.method, argument: message.argument };
+      if (message.method === "localSearch") {
+        // 本地索引查询只读内存和 IndexedDB，可与在线搜索或其他 Agent 查询并行发送。
+        request.parallel = true;
+        dispatch(request);
+        return;
+      }
       state.requestQueue.push(request);
       pump();
       return;
@@ -300,15 +314,15 @@ function routeBridgeMessages(bridge) {
       const request = state.pending.get(message.id);
       state.pending.delete(message.id);
       clearTimer(request);
-      state.extensionBusy = false;
+      if (!request.parallel) state.extensionBusy = false;
       sendResponse(request.socket, request.id, message.result);
-      pump();
+      if (!request.parallel) pump();
     }
   };
 }
 
 function cliHelp() {
-  return `邮人全搜 Agent Bridge（Node.js 22 或更高版本）\n\n用法：\n  node agent-bridge.mjs start [--port 17832] [--token <令牌>]\n  node agent-bridge.mjs health --port 17832 --token <令牌>\n\n说明：Bridge 只监听 127.0.0.1；支持多个 Agent 连接，扩展请求按顺序处理，单个请求默认 30 秒超时。\n`;
+  return `邮人全搜 Agent Bridge（Node.js 22 或更高版本）\n\n用法：\n  node agent-bridge.mjs start [--port 17832] [--token <令牌>]\n  node agent-bridge.mjs health --port 17832 --token <令牌>\n\n说明：Bridge 只监听 127.0.0.1；支持多个 Agent 连接。在线搜索与任务控制按顺序处理，只读 localSearch 可并行执行；单个请求默认 30 秒超时。\n`;
 }
 
 async function run(argv = process.argv.slice(2)) {

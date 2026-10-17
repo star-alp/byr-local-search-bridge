@@ -13,7 +13,7 @@ const CONFIG_FILE_NAME = "bridge.json";
 // 直接调用扩展 Agent 的命令默认使用本地 Bridge，避免 AI 还要手动配置 Chrome 调试端口。
 const AGENT_COMMANDS = new Set(["ask", "preview", "context", "resources", "failures", "tasks", "task", "request-profile", "capabilities", "status", "scopes", "boards", "search", "results", "cancel", "pause", "resume", "retry"]);
 // 只对幂等读取请求自动重试，避免 startSearch、暂停和保存类操作被重复执行。
-const RETRYABLE_BRIDGE_METHODS = new Set(["getCapabilities", "getStatus", "getContext", "getResourceUsage", "getFailures", "listTasks", "getTask", "previewSearch", "listScopes", "listBoards", "getResults"]);
+const RETRYABLE_BRIDGE_METHODS = new Set(["getCapabilities", "getStatus", "getContext", "getResourceUsage", "getFailures", "localSearch", "listTasks", "getTask", "previewSearch", "listScopes", "listBoards", "getResults"]);
 const BRIDGE_RETRY_DELAYS_MS = Object.freeze([500, 1500]);
 
 function configFilePath() {
@@ -261,6 +261,8 @@ function cliHelp() {
   node agent-cli.mjs doctor
   node agent-cli.mjs doctor --fix
   node agent-cli.mjs ask --query "<关键词>"
+  node agent-cli.mjs ask --query "<关键词>" --mode local
+  node agent-cli.mjs ask --query "<关键词>" --mode auto
   node agent-cli.mjs preview --query "<关键词>"
   node agent-cli.mjs context
   node agent-cli.mjs resources
@@ -290,6 +292,8 @@ function cliHelp() {
   --format json     输出单个 JSON；使用 jsonl 时每行输出一个 JSON 对象
   --stream          搜索时逐条输出新增结果，最后输出 done 事件
   --query <关键词>  搜索关键词；请使用引号包住包含空格的内容
+
+本地搜索不会访问论坛；auto 表示本地优先，由 AI 根据索引状态决定是否另行发起 online 搜索。
 
 只读状态、资源和结果请求遇到 Bridge 临时断线时会自动重试；启动、暂停、继续和重试任务不会自动重复执行。
 小白用户推荐：先让 AI 执行 setup，再使用 ask；端口、令牌和轮询过程会自动处理。
@@ -522,10 +526,30 @@ async function waitForResults(client, start, options) {
   };
 }
 
+function outputLocalSearch(result, options) {
+  const streaming = Boolean(options.stream || options.format === "jsonl");
+  if (!streaming) {
+    output(result, options.pretty, options.format || "json");
+    return;
+  }
+  result.results?.forEach((item) => output({ schemaVersion: 1, type: "result", searchId: null, total: result.total, item }, false, "jsonl"));
+  output({ schemaVersion: 1, type: "done", ...result }, false, "jsonl");
+}
+
 async function runCommand(client, options) {
   if (options.command === "search" || options.command === "ask") {
     if (options.command === "ask" && !String(options.query || "").trim()) throw new Error("ask 需要 --query 搜索关键词");
-    const start = await invokeClient(client, "startSearch", searchOptions(options));
+    const requested = searchOptions(options);
+    if (requested.mode === "local" || requested.mode === "auto") {
+      const local = await invokeClient(client, "localSearch", { ...requested, mode: "local", limit: numberOption(options, "limit", 20, 1, 100) });
+      if (requested.mode === "auto") {
+        local.mode = "auto";
+        local.auto = { strategy: "local-first", onlineStarted: false, recommendation: local.total ? "本地结果已返回；如需更新，可另行执行 online 搜索" : "本地没有命中，建议由 AI 决定是否执行 online 搜索" };
+      }
+      outputLocalSearch(local, options);
+      return;
+    }
+    const start = await invokeClient(client, "startSearch", requested);
     if (options.command === "ask" || options.wait || options.watch) {
       const streaming = Boolean(options.stream || (options.command === "ask" && options.format === "jsonl"));
       const waitOptions = options.command === "ask"

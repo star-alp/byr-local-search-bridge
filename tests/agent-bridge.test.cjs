@@ -239,6 +239,7 @@ test("Agent CLI 的 ask 会自动启动搜索、等待完成并返回结果", as
     if (message.method === "startSearch") extension.send(JSON.stringify({ type: "response", id: message.id, result: { ok: true, apiVersion: 1, searchId: "search-1", running: true } }));
     if (message.method === "getResults") extension.send(JSON.stringify({ type: "response", id: message.id, result: { ok: true, apiVersion: 1, searchId: "search-1", running: false, hasMore: false, nextCursor: null, total: 1, items: [{ id: "thread:Study:1", type: "thread", title: "课程资料", url: "https://bbs.byr.cn/article/Study/1" }] } }));
     if (message.method === "getStatus") extension.send(JSON.stringify({ type: "response", id: message.id, result: { ok: true, apiVersion: 1, searchId: "search-1", status: "complete", running: false } }));
+    if (message.method === "localSearch") extension.send(JSON.stringify({ type: "response", id: message.id, result: { ok: true, apiVersion: 1, mode: "local", index: { documents: 8, lastUpdatedAt: 1234 }, total: 1, results: [{ id: "local:1", title: "本地资料" }] } }));
   });
   const result = await runCli(["ask", "--transport", "bridge", "--port", String(port), "--token", TOKEN, "--query", "课程资料", "--limit", "1"]);
   assert.equal(result.code, 0, result.stderr);
@@ -255,6 +256,52 @@ test("Agent CLI 的 ask 会自动启动搜索、等待完成并返回结果", as
   const formatted = await runCli(["ask", "--transport", "bridge", "--port", String(port), "--token", TOKEN, "--query", "课程资料", "--limit", "1", "--format", "jsonl"]);
   assert.equal(formatted.code, 0, formatted.stderr);
   assert.equal(JSON.parse(formatted.stdout.trim().split("\n").at(-1)).type, "done");
+  const local = await runCli(["ask", "--transport", "bridge", "--port", String(port), "--token", TOKEN, "--query", "本地资料", "--mode", "local", "--limit", "1"]);
+  assert.equal(local.code, 0, local.stderr);
+  assert.equal(JSON.parse(local.stdout).mode, "local");
+  assert.equal(JSON.parse(local.stdout).index.documents, 8);
+  const auto = await runCli(["ask", "--transport", "bridge", "--port", String(port), "--token", TOKEN, "--query", "本地资料", "--mode", "auto", "--limit", "1"]);
+  assert.equal(auto.code, 0, auto.stderr);
+  const autoOutput = JSON.parse(auto.stdout);
+  assert.equal(autoOutput.mode, "auto");
+  assert.equal(autoOutput.auto.onlineStarted, false);
+  extension.close();
+  await bridge.close();
+});
+
+test("Agent Bridge 允许多个本地查询并行，不阻塞在线请求队列", async () => {
+  const bridgeModule = await import("../agent-bridge.mjs");
+  const bridge = bridgeModule.createBridgeServer({ port: 0, token: TOKEN });
+  bridgeModule.routeBridgeMessages(bridge);
+  await bridge.listen();
+  const port = bridge.server.address().port;
+  const extension = await openSocket(`ws://127.0.0.1:${port}/agent?role=extension&token=${TOKEN}`);
+  const agent = await openSocket(`ws://127.0.0.1:${port}/agent?role=agent&token=${TOKEN}`);
+  const received = [];
+  extension.addEventListener("message", (event) => {
+    const message = JSON.parse(event.data);
+    if (message.type !== "request") return;
+    received.push(message.method);
+    setTimeout(() => extension.send(JSON.stringify({ type: "response", id: message.id, result: { ok: true, apiVersion: 1, method: message.method } })), 25);
+  });
+  const request = (id, method) => new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("并行本地查询超时")), 1000);
+    const onMessage = (event) => {
+      const message = JSON.parse(event.data);
+      if (message.type !== "response" || message.id !== id) return;
+      clearTimeout(timer);
+      agent.removeEventListener("message", onMessage);
+      resolve(message.result);
+    };
+    agent.addEventListener("message", onMessage);
+    agent.send(JSON.stringify({ type: "request", id, method, argument: { query: id } }));
+  });
+  const [first, second, online] = await Promise.all([request("local-a", "localSearch"), request("local-b", "localSearch"), request("online-status", "getStatus")]);
+  assert.equal(first.method, "localSearch");
+  assert.equal(second.method, "localSearch");
+  assert.equal(online.method, "getStatus");
+  assert.deepEqual(received, ["localSearch", "localSearch", "getStatus"]);
+  agent.close();
   extension.close();
   await bridge.close();
 });
